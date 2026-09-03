@@ -1,12 +1,12 @@
 """SSRF-guarded image fetch cho ``zalo_send_image(image_url=...)``.
 
-Model chỉ đưa MỘT url (vd ``qr_url`` từ media_store ``mcp.tino.vn``); adapter tải
+Model chỉ đưa MỘT url (vd ``qr_url`` từ media_store ``mcp.hitechcloud.vn``); adapter tải
 ảnh SERVER-SIDE rồi gửi vào Zalo. Bytes/URL KHÔNG hiển thị cho khách và base64
 11KB không còn phải đi qua LLM (nguồn gốc cú treo ~160s ở flow QR cũ).
 
 Chống SSRF (model-controlled URL fetch server-side):
   * chỉ ``https`` — từ chối http/ftp/file/...
-  * host phải nằm trong allowlist (mặc định ``mcp.tino.vn`` — domain nội bộ Tino,
+  * host phải nằm trong allowlist (mặc định ``mcp.hitechcloud.vn`` — domain nội bộ hitechcloud,
     nơi media_store phát QR); từ chối IP literal + host lạ → chặn 169.254.169.254,
     127.0.0.1, dịch vụ nội bộ.
   * CẤM redirect (3xx → lỗi) — chống bounce sang host nội bộ sau khi qua allowlist.
@@ -32,7 +32,7 @@ except Exception:  # pragma: no cover - path-loaded in production
 
 MAX_IMAGE_BYTES = 10 * 1024 * 1024   # khớp cap của _zalo_send_image_handler
 DEFAULT_TIMEOUT = 20.0
-DEFAULT_ALLOWED_HOSTS = ("mcp.tino.vn",)
+DEFAULT_ALLOWED_HOSTS = ("mcp.hitechcloud.vn",)
 
 # http_open(url, timeout) -> file-like response (.read(n), .close()).
 # MUST NOT follow redirects. Default impl bên dưới; test inject fake.
@@ -81,7 +81,7 @@ def _default_http_open(url: str, timeout: float):
     """Opener urllib TỪ CHỐI redirect (3xx → ImageUrlError) + KHÔNG dùng proxy.
 
     ProxyHandler({}) rỗng vô hiệu proxy env (http_proxy/https_proxy) → fetch đi
-    THẲNG tới host đã allowlist (mcp.tino.vn, Hermes vốn nối thẳng), xác định +
+    THẲNG tới host đã allowlist (mcp.hitechcloud.vn, Hermes vốn nối thẳng), xác định +
     tránh route bất ngờ qua proxy.
     """
     opener = urllib.request.build_opener(
@@ -141,7 +141,7 @@ def fetch_image_from_url(
 def resolve_allowed_hosts(env_value: Optional[str]) -> Tuple[str, ...]:
     """Parse ``ZALO_IMAGE_URL_ALLOWED_HOSTS`` (phẩy ngăn cách) → tuple host.
 
-    Trống/None → mặc định ``mcp.tino.vn``. Luôn có ít nhất default để không mở
+    Trống/None → mặc định ``mcp.hitechcloud.vn``. Luôn có ít nhất default để không mở
     toang allowlist do config trống.
     """
     if not env_value or not env_value.strip():
