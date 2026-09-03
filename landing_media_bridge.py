@@ -16,7 +16,7 @@ Security contract (see plan Phase 3):
     retry with identical bytes targets the same object and never overwrites a
     different newer image.
   * Images are downscaled to ``BridgeConfig.max_dim`` (default 1024px longest
-    side, env override ``TINO_LANDING_IMAGE_MAX_DIM``) before upload — a phone
+    side, env override ``HITECHCLOUD_LANDING_IMAGE_MAX_DIM``) before upload — a phone
     photo shrinks ~10-30x and no longer bounces off the 6MB server cap. The
     resize is fail-open (see ``image_resize.py``): without Pillow the original
     bytes are uploaded under the old 6MB rule.
@@ -113,7 +113,7 @@ def read_cached_image(cache_dir: str, local_path: str, *, max_bytes: int = MAX_I
 
 @dataclass
 class BridgeConfig:
-    url: str          # fixed HTTPS origin, e.g. https://mcp.tino.vn/tools/landing_upload_image
+    url: str          # fixed HTTPS origin, e.g. https://mcp.hitechcloud.vn/tools/landing_upload_image
     key: str          # upload-only agent key (read from env, never logged)
     cache_dir: str
     max_dim: int = MAX_DIMENSION_DEFAULT  # longest image side after downscale
@@ -121,8 +121,8 @@ class BridgeConfig:
 
 def load_bridge_config(env: Dict[str, str], cache_dir: str) -> BridgeConfig:
     """Read the bridge config from the environment and validate the URL shape."""
-    url = str(env.get("TINO_LANDING_BRIDGE_URL") or "").strip()
-    key = str(env.get("TINO_LANDING_BRIDGE_KEY") or "").strip()
+    url = str(env.get("HITECHCLOUD_LANDING_BRIDGE_URL") or "").strip()
+    key = str(env.get("HITECHCLOUD_LANDING_BRIDGE_KEY") or "").strip()
     if not url or not key:
         raise BridgeError("bridge URL/key not configured")
     if not url.lower().startswith("https://"):
@@ -132,7 +132,7 @@ def load_bridge_config(env: Dict[str, str], cache_dir: str) -> BridgeConfig:
     # Per-VPS override lives in env (plugin updates reset the git tree, so code
     # edits don't survive) — out-of-range or non-numeric values fall back.
     max_dim = MAX_DIMENSION_DEFAULT
-    raw_dim = str(env.get("TINO_LANDING_IMAGE_MAX_DIM") or "").strip()
+    raw_dim = str(env.get("HITECHCLOUD_LANDING_IMAGE_MAX_DIM") or "").strip()
     if raw_dim:
         try:
             v = int(raw_dim)
@@ -145,7 +145,7 @@ def load_bridge_config(env: Dict[str, str], cache_dir: str) -> BridgeConfig:
 
 # session_resolver(task_id) -> {"chat_id": str, "conv_id": str} | None
 #   chat_id: authorized recent-image namespace selector
-#   conv_id: Tino-MCP conversation id (sent as X-Session); == chat_id here
+#   conv_id: HiTechCloud-MCP conversation id (sent as X-Session); == chat_id here
 SessionResolver = Callable[[str], Optional[Dict[str, str]]]
 # recent_fn(chat_id, count) -> list of objects with .local_path / .from_name
 RecentFn = Callable[[str, int], List[Any]]
@@ -168,8 +168,8 @@ class LandingMediaBridge:
             raise BridgeError("slug required")
         # Trusted identity resolved from task_id ONLY (model cannot override):
         #   chat_id  — selects the authorized recent-image namespace
-        #   conv_id  — the Tino-MCP conversation id sent as X-Session. In this
-        #              deployment Hermes scopes tino landings by the Zalo chat,
+        #   conv_id  — the HiTechCloud-MCP conversation id sent as X-Session. In this
+        #              deployment Hermes scopes HiTechCloud landings by the Zalo chat,
         #              so conv_id == chat_id and ownership matches the agent's
         #              own landing_build/update calls. (Verified: landing_list
         #              returns a chat's demos only under X-Session = chat_id.)
