@@ -26,19 +26,32 @@ import { createServer } from "node:http";
 import { promises as fs } from "node:fs";
 import path from "node:path";
 import { Buffer } from "node:buffer";
-import { randomUUID } from "node:crypto";
 import { Zalo, LoginQRCallbackEventType, ThreadType, Reactions } from "zca-js";
 import { HttpsProxyAgent } from "https-proxy-agent";
 import { ProxyAgent, fetch as undiciFetch } from "undici";
+import {
+  resolveSessionDir,
+  resolveMediaCacheDir,
+  downloadMediaStreamed,
+  safeExtFromFilename,
+  imageMimeForExt,
+  createSemaphore,
+  DEFAULT_MAX_DOWNLOAD_BYTES,
+  DEFAULT_DOWNLOAD_TIMEOUT_MS,
+} from "./media-contract.js";
 
 // ─── Config ──────────────────────────────────────────────────────────────
 
 const PORT = parseInt(process.env.ZALO_PERSONAL_SIDECAR_PORT || "3838", 10);
-const SESSION_DIR = process.env.ZALO_PERSONAL_SESSION_DIR || path.join(process.env.HOME || "/opt/data", "zalo");
+// Single resolver shared with the Python adapter — canonical default
+// /opt/data/zalo (see media-contract.js). Fixes the historical $HOME/zalo
+// vs /opt/data/zalo split that rejected valid local images.
+const SESSION_DIR = resolveSessionDir();
 const SESSION_FILE = path.join(SESSION_DIR, "session.json");
 const QR_FILE = path.join(SESSION_DIR, "qr.png");
-const MEDIA_CACHE_DIR = path.join(SESSION_DIR, "media-cache");
+const MEDIA_CACHE_DIR = resolveMediaCacheDir();
 const PROXY = process.env.ZALO_PERSONAL_PROXY || "";
+const MAX_CONCURRENT_DOWNLOADS = parseInt(process.env.ZALO_PERSONAL_MAX_CONCURRENT_DOWNLOADS || "4", 10);
 
 // UA pool — VN focused (Win Chrome + Win Edge + Mac Chrome), KHÔNG có Linux/Firefox
 const UA_POOL = [
@@ -65,6 +78,22 @@ let state = {
 
 const wsClients = new Set();
 
+// Monotonic per-thread ingress sequence. Assigned BEFORE the first async media
+// download so the adapter can restore true message order even when downloads
+// finish out of order (a newer small image can complete before an older large
+// one). Paired with event_ts in the adapter's recent-image index.
+const _ingressSeq = new Map(); // thread_id -> counter
+function nextIngressSeq(threadId) {
+  const key = String(threadId ?? "");
+  const n = (_ingressSeq.get(key) || 0) + 1;
+  _ingressSeq.set(key, n);
+  return n;
+}
+
+// Bound concurrent media hydrations so one slow media host cannot exhaust
+// memory / stall every chat's message callback.
+const _downloadSem = createSemaphore(MAX_CONCURRENT_DOWNLOADS);
+
 // ─── Helpers ─────────────────────────────────────────────────────────────
 
 function broadcast(event) {
@@ -85,8 +114,11 @@ function pickUa() {
 }
 
 async function ensureDirs() {
-  await fs.mkdir(SESSION_DIR, { recursive: true });
-  await fs.mkdir(MEDIA_CACHE_DIR, { recursive: true });
+  await fs.mkdir(SESSION_DIR, { recursive: true, mode: 0o700 });
+  await fs.mkdir(MEDIA_CACHE_DIR, { recursive: true, mode: 0o700 });
+  // mkdir mode is masked by umask; enforce explicitly (best-effort).
+  try { await fs.chmod(SESSION_DIR, 0o700); } catch { /* noop */ }
+  try { await fs.chmod(MEDIA_CACHE_DIR, 0o700); } catch { /* noop */ }
 }
 
 async function saveSession(creds) {
@@ -97,8 +129,10 @@ async function saveSession(creds) {
     uid: state.uid,
     saved_at: Date.now(),
   };
-  await fs.writeFile(SESSION_FILE, JSON.stringify(data, null, 2));
-  console.log(`[session] saved to ${SESSION_FILE}`);
+  // Session file holds the Zalo cookie — restrict to owner read/write only.
+  await fs.writeFile(SESSION_FILE, JSON.stringify(data, null, 2), { mode: 0o600 });
+  try { await fs.chmod(SESSION_FILE, 0o600); } catch { /* noop */ }
+  console.log("[session] saved");
 }
 
 async function loadSession() {
@@ -150,7 +184,10 @@ async function imageMeta(filePath) {
 }
 
 function makeZaloOptions() {
-  const opts = { selfListen: false, checkUpdate: false, logging: true, imageMetadataGetter: imageMeta };
+  // selfListen: true là BẮT BUỘC để zca-js emit group_event khi CHÍNH bot được
+  // thêm vào nhóm (isSelf=true, xem zca-js listen.js:238). Echo tin của bot bị
+  // chặn ngay trong message handler (if msg.isSelf return) nên không gây loop.
+  const opts = { selfListen: true, checkUpdate: false, logging: true, imageMetadataGetter: imageMeta };
   if (!PROXY) return opts;
   try {
     opts.agent = new HttpsProxyAgent(PROXY);
@@ -254,7 +291,9 @@ function attachApi(api) {
 
   api.listener.on("message", async (msg) => {
     try {
-      console.log("[msg]", JSON.stringify({ type: msg.type, data: msg.data }).slice(0, 500));
+      // selfListen=true khiến zca-js emit cả tin của CHÍNH bot. Chặn echo ở
+      // đây để không forward tin tự-gửi cho adapter (tránh bot tự trả lời mình).
+      if (msg && msg.isSelf) return;
       const d = msg.data || {};
       // zca-js: msg.type numeric — 0=DirectMessage, 1=GroupMessage.
       // Fallback: idTo !== self uid means it's a group thread (group id vs bot uid).
@@ -262,6 +301,16 @@ function attachApi(api) {
         msg.type === 1 ||
         msg.type === "GroupMessage" ||
         (state.uid && d.idTo && String(d.idTo) !== String(state.uid));
+      const threadId = isGroup ? d.idTo : d.uidFrom;
+      // Assign ingress order BEFORE any async media download so the adapter can
+      // reconstruct true order regardless of download completion timing.
+      const ingressSeq = nextIngressSeq(threadId);
+      // Metadata-only log — never raw msg.data (may hold customer text, media
+      // URLs, cookies). Category/counter only.
+      console.log("[msg]", JSON.stringify({
+        type: msg.type, thread: isGroup ? "group" : "user",
+        msg_id: d.msgId, seq: ingressSeq, has_content: !!d.content,
+      }));
       let content = await hydrateMedia(parseContent(d.content));
       // chat.photo (ảnh KÈM caption) bị Zalo gửi dạng {title,href,thumb} →
       // parseContent nhầm thành text. Ép lại thành image để tải file về
@@ -283,15 +332,45 @@ function attachApi(api) {
           cli_msg_id: String(d.quote.cliMsgId || ""),
           text: String(d.quote.msg || ""),
         };
+        // Tin ĐƯỢC QUOTE có media? zca-js để nguyên `attach` là JSON string
+        // ({title, href, thumb, hdUrl...}). Nếu là ảnh thì tải về local để
+        // bot "đọc" được ảnh đang bị reply (vision).
+        if (d.quote.attach) {
+          try {
+            const att = typeof d.quote.attach === "string" ? JSON.parse(d.quote.attach) : d.quote.attach;
+            // CHỈ lấy URL từ field ảnh chuyên dụng. `href` là URL bất kỳ do
+            // CLIENT người gửi kiểm soát (link share / có thể craft SSRF tới
+            // metadata endpoint nội bộ) — chỉ chấp nhận khi có đuôi ảnh rõ ràng.
+            const isImgUrl = (u) => /\.(jpe?g|png|gif|webp)(\?|$)/i.test(String(u || ""));
+            let qUrl = att.hdUrl || att.oriUrl || att.normalUrl || att.thumbUrl || "";
+            if (!qUrl && isImgUrl(att.href)) qUrl = att.href;
+            if (!qUrl && isImgUrl(att.thumb)) qUrl = att.thumb;
+            if (qUrl && /^https?:\/\//i.test(String(qUrl))) {
+              const cached = await downloadMedia(qUrl, { kind: "image" });
+              if (cached && cached.is_image && cached.path) {
+                quote.image = {
+                  local_path: cached.path,
+                  cache_key: cached.cache_key,
+                  media_url: `/media/${cached.cache_key}`,
+                  mime_type: cached.mime || imageMimeForExt(cached.ext) || null,
+                  extension: cached.ext,
+                  url: qUrl,
+                  title: String(att.title || ""),
+                };
+              }
+            }
+          } catch (e) { console.warn("[quote attach]", e?.message || e); }
+        }
       }
       const event = {
         type: "message",
         msg_id: d.msgId,
-        thread_id: isGroup ? d.idTo : d.uidFrom,
+        thread_id: threadId,
         thread_type: isGroup ? "group" : "user",
         from_uid: d.uidFrom,
         from_name: d.dName || "",
         ts: d.ts || Date.now(),
+        ingress_seq: ingressSeq,
         content,
         mentions: Array.isArray(d.mentions) ? d.mentions : [],
         quote,
@@ -311,6 +390,12 @@ function attachApi(api) {
       // Forward friend_event tới adapter để tự-động-chấp-nhận lời mời kết bạn.
       if (evName === "friend_event") {
         try { broadcast({ type: "friend_event", data: args.length === 1 ? args[0] : args }); }
+        catch (e) { /* noop */ }
+      }
+      // Forward group_event tới adapter để chào nhóm khi bot được thêm vào group.
+      // zca-js emit GroupEvent = { type, act, data:{groupId,groupName,updateMembers,...}, threadId, isSelf }
+      if (evName === "group_event") {
+        try { broadcast({ type: "group_event", data: args.length === 1 ? args[0] : args }); }
         catch (e) { /* noop */ }
       }
     });
@@ -388,6 +473,22 @@ function scheduleWsReconnect() {
 function parseContent(c) {
   if (typeof c === "string") return { kind: "text", text: c };
   if (!c || typeof c !== "object") return { kind: "unknown" };
+  // Log cuộc gọi (thoại/video): Zalo đẩy dưới dạng msgType "chat.recommended"
+  // với content.action chứa "call" (…call.miss = gọi nhỡ/huỷ). Phải bắt TRƯỚC
+  // nhánh title+href bên dưới — nhánh đó coi nó là link preview và nuốt mất
+  // field `action`, adapter hết đường phân biệt. `kind: "call"` cũng giúp tin
+  // này không bị bộ lọc synthetic của adapter drop (nó chỉ drop text/unknown).
+  if (c.action && /call/i.test(String(c.action))) {
+    const act = String(c.action);
+    return {
+      kind: "call",
+      action: act,
+      missed: /miss/i.test(act),
+      video: /video/i.test(act),
+      title: c.title ? String(c.title) : "",
+      description: c.description ? String(c.description) : "",
+    };
+  }
   if (c.thumbUrl || c.normalUrl || c.hdUrl) {
     return {
       kind: "image",
@@ -434,52 +535,30 @@ function parseContent(c) {
   return { kind: "unknown", raw: c };
 }
 
-const MAX_DOWNLOAD_BYTES = 50 * 1024 * 1024; // 50MB
+const MAX_DOWNLOAD_BYTES = DEFAULT_MAX_DOWNLOAD_BYTES; // 50MB
 
-async function downloadMedia(url, ext = "") {
+/**
+ * Bounded, concurrency-capped media download. Streams to disk with a hard byte
+ * cap + deadline, detects the real type by magic bytes, saves under the true
+ * extension and returns rich metadata (mime, ext, is_image). See
+ * media-contract.downloadMediaStreamed.
+ *
+ * @param {string} url
+ * @param {{kind?: "image"|"voice"|"file", hintExt?: string}} [opts]
+ */
+async function downloadMedia(url, opts = {}) {
   if (!url) return null;
-  try {
-    const fetchFn = makeZaloOptions().polyfill || fetch;
-    const resp = await fetchFn(url);
-    if (!resp.ok) {
-      console.warn(`[media] download ${url} → HTTP ${resp.status}`);
-      return null;
-    }
-    // Chặn sớm theo Content-Length nếu có.
-    const clen = Number(resp.headers.get("content-length") || 0);
-    if (clen && clen > MAX_DOWNLOAD_BYTES) {
-      console.warn(`[media] file qua lon (${clen} bytes > 50MB), bo qua: ${url}`);
-      return { too_large: true, bytes: clen };
-    }
-    const buf = Buffer.from(await resp.arrayBuffer());
-    // Backstop: thieu/khai man Content-Length.
-    if (buf.length > MAX_DOWNLOAD_BYTES) {
-      console.warn(`[media] file qua lon (${buf.length} bytes > 50MB), bo ghi: ${url}`);
-      return { too_large: true, bytes: buf.length };
-    }
-    const cacheKey = randomUUID() + (ext ? `.${ext.replace(/^\./, "")}` : "");
-    const filePath = path.join(MEDIA_CACHE_DIR, cacheKey);
-    await fs.writeFile(filePath, buf);
-    return { cache_key: cacheKey, path: filePath, bytes: buf.length };
-  } catch (e) {
-    console.warn("[media] download failed:", e.message);
-    return null;
-  }
-}
-
-function guessExt(content) {
-  if (content.kind === "image") return "jpg";
-  if (content.kind === "voice") {
-    const fname = content.filename || "";
-    const m = fname.match(/\.([a-zA-Z0-9]+)$/);
-    return m ? m[1] : "m4a";
-  }
-  if (content.kind === "file") {
-    const fname = content.filename || "";
-    const m = fname.match(/\.([a-zA-Z0-9]+)$/);
-    return m ? m[1] : "bin";
-  }
-  return "";
+  const { kind = "file", hintExt = "" } = typeof opts === "string" ? { kind: "file" } : opts;
+  const fetchFn = makeZaloOptions().polyfill || fetch;
+  return _downloadSem.run(() =>
+    downloadMediaStreamed(fetchFn, url, {
+      cacheDir: MEDIA_CACHE_DIR,
+      kind,
+      hintExt,
+      maxBytes: MAX_DOWNLOAD_BYTES,
+      timeoutMs: DEFAULT_DOWNLOAD_TIMEOUT_MS,
+    }),
+  );
 }
 
 // Đuôi file nguy hiểm — KHÔNG tải về (file thực thi, script, macro office...).
@@ -499,22 +578,44 @@ async function hydrateMedia(content) {
   if (!["image", "voice", "file"].includes(content.kind)) return content;
   // Chặn đuôi nguy hiểm: KHÔNG tải về đĩa, đánh dấu để adapter báo người dùng.
   if (content.kind === "file" && isDangerousFile(content.filename)) {
-    console.warn(`[media] BLOCKED dangerous file: ${content.filename}`);
+    console.warn("[media] BLOCKED dangerous file (by extension)");
     content.blocked = true;
     content.block_reason = "dangerous_extension";
     return content;
   }
-  const ext = guessExt(content);
-  const cached = await downloadMedia(content.url, ext);
-  if (cached && cached.too_large) {
+  // For non-image kinds the sender filename is the extension hint; images get
+  // their extension from magic bytes only.
+  const hintExt = content.kind === "image"
+    ? ""
+    : safeExtFromFilename(content.filename, content.kind === "voice" ? "m4a" : "bin");
+  const cached = await downloadMedia(content.url, { kind: content.kind, hintExt });
+  if (!cached) return content;
+  if (cached.too_large) {
     content.too_large = true;
     content.bytes = cached.bytes;
-  } else if (cached) {
-    content.cache_key = cached.cache_key;
-    content.local_path = cached.path;
-    content.bytes = cached.bytes;
-    content.media_url = `/media/${cached.cache_key}`;
+    return content;
   }
+  if (cached.invalid_image) {
+    // Declared/looked like an image but the bytes are not a valid image; do not
+    // route to vision and do not cache a bogus file.
+    content.invalid_image = true;
+    return content;
+  }
+  // Reclassify a Zalo File whose bytes are actually an image (fileUrl-delivered
+  // photos) — only after magic validation.
+  if (content.kind === "file" && cached.is_image) {
+    content.kind = "image";
+  }
+  content.cache_key = cached.cache_key;
+  content.local_path = cached.path;
+  content.bytes = cached.bytes;
+  content.media_url = `/media/${cached.cache_key}`;
+  content.extension = cached.ext;
+  content.is_image = !!cached.is_image;
+  content.mime_type = cached.mime
+    || (cached.is_image ? imageMimeForExt(cached.ext) : null)
+    || cached.content_type
+    || null;
   return content;
 }
 
@@ -530,6 +631,10 @@ app.get("/health", (req, res) => {
     name: state.name,
     error: state.error,
     has_session_file: !!(state.imei),
+    // Resolved roots so the adapter can verify both processes agree on one
+    // cache location and fail closed on mismatch at startup.
+    session_dir: SESSION_DIR,
+    media_cache_dir: MEDIA_CACHE_DIR,
   });
 });
 
@@ -836,7 +941,7 @@ app.post("/send/media", async (req, res) => {
   for (const img of images.slice(0, 10)) {
     const s = String(img || "");
     if (/^https?:\/\//i.test(s)) {
-      const c = await downloadMedia(s, "jpg");
+      const c = await downloadMedia(s, { kind: "image" });
       if (c?.path) paths.push(c.path);
     } else {
       try { await fs.access(s); paths.push(s); } catch { /* bỏ qua file không tồn tại */ }
@@ -986,6 +1091,52 @@ app.get("/friends/all", async (req, res) => {
     const friends = arr.map(_normUser).filter(Boolean);
     res.json({ ok: true, count: friends.length, friends });
   } catch (e) { res.status(500).json({ error: e?.message || String(e) }); }
+});
+
+// ─── Generic zca-js passthrough ──────────────────────────────────────────
+// "Đẩy hết tính năng zca-js qua một lần": gọi BẤT KỲ method nào trên api
+// object (createPoll, createNote, createReminder, acceptFriendRequest,
+// votePoll, getListBoard, sendVoice, forwardMessage, createGroup...).
+//
+// body: { method: "createPoll", args: [ {question, options}, "groupId" ] }
+// ThreadType truyền dạng SỐ: User=0, Group=1 (đúng enum zca-js).
+//
+// Bảo mật: server chỉ bind 127.0.0.1 + adapter gate owner-only ở tầng tool.
+// Denylist chặn method lộ credentials / phá session đang chạy.
+const API_CALL_DENY = new Set(["listen", "login", "loginQR", "getCookie", "getContext"]);
+
+app.post("/api/call", async (req, res) => {
+  if (state.status !== "connected") return res.status(503).json({ error: "not_connected" });
+  const { method, args } = req.body || {};
+  if (!method || typeof method !== "string") {
+    return res.status(400).json({ error: "method required" });
+  }
+  if (API_CALL_DENY.has(method) || method.startsWith("_")) {
+    return res.status(403).json({ error: `method '${method}' is blocked` });
+  }
+  // Own-property only — chặn resolve method kế thừa từ prototype
+  // (constructor, toString...). zca-js gán method trực tiếp lên api object.
+  const fn = state.api && Object.prototype.hasOwnProperty.call(state.api, method)
+    ? state.api[method] : undefined;
+  if (typeof fn !== "function") {
+    return res.status(404).json({ error: `unknown api method: ${method}` });
+  }
+  try {
+    const result = await fn.apply(state.api, Array.isArray(args) ? args : []);
+    res.json({ ok: true, result: result === undefined ? null : result });
+  } catch (e) {
+    console.error(`[api/call ${method}]`, e?.message || e);
+    res.status(500).json({ error: e?.message || String(e) });
+  }
+});
+
+// Liệt kê method khả dụng — để adapter/agent khám phá năng lực zca-js.
+app.get("/api/methods", (req, res) => {
+  if (state.status !== "connected") return res.status(503).json({ error: "not_connected" });
+  const methods = Object.keys(state.api || {})
+    .filter((k) => typeof state.api[k] === "function" && !API_CALL_DENY.has(k) && !k.startsWith("_"))
+    .sort();
+  res.json({ ok: true, count: methods.length, methods });
 });
 
 // ─── Server bootstrap ────────────────────────────────────────────────────
