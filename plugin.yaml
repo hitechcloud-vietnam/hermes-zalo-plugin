@@ -59,6 +59,6 @@ optional_env:
     prompt: "Name triggers"
     password: false
   - name: ZALO_IMAGE_URL_ALLOWED_HOSTS
-    description: "Host cho phép khi zalo_send_image tải ảnh từ image_url (phẩy ngăn cách). THAY THẾ mặc định 'mcp.tino.vn' — nếu set, PHẢI tự kèm mcp.tino.vn nếu vẫn cần gửi QR (không thì flow QR gãy). Chống SSRF: chỉ tải ảnh từ các host này."
+    description: "Host cho phép khi zalo_send_image tải ảnh từ image_url (phẩy ngăn cách). THAY THẾ mặc định 'mcp.hitechcloud.vn' — nếu set, PHẢI tự kèm mcp.hitechcloud.vn nếu vẫn cần gửi QR (không thì flow QR gãy). Chống SSRF: chỉ tải ảnh từ các host này."
     prompt: "Allowed image URL hosts"
     password: false
