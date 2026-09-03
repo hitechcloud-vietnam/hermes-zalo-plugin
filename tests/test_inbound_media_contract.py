@@ -1,4 +1,4 @@
-"""Tests for inbound_media.py — magic sniffing, path safety, normalization and
+"""Tests for inbound_media.py — magic sniffing, path safety, normalization and 
 the bounded RecentImageIndex. Pure stdlib unittest, no Hermes / Zalo needed."""
 
 import os
