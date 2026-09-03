@@ -15,6 +15,7 @@ Configuration via env vars:
 
 import asyncio
 import datetime
+import functools
 import json
 import logging
 import os
@@ -51,6 +52,19 @@ _NOISY_STATUS_RE = re.compile(
     r"|auxiliary\s+.+\s+failed"
     r"|no\s+auxiliary\s+llm\s+provider"
     r"|auto-lowered\s+compression"
+    r"|auto-?compaction\s+was\s+raised"
+    r"|caps\s+context\s+at"
+    r"|compression\.\w*autoraise"
+    r"|compression\s+aborted"
+    r"|conversation\s+continues\s+unchanged"
+    r"|no\s+messages\s+were\s+dropped"
+    r"|start\s+a\s+fresh\s+session"
+    r"|run\s+/compress"
+    r"|/compress\s+to\s+retry"
+    r"|/new\s+to\s+start"
+    r"|total\s+timeout"
+    r"|auxiliary\s+\w+\s+stream"
+    r"|session\s+(?:was\s+)?automatically\s+reset"
     r"|invalid\s+responses"
     r"|trying\s+fallback"
     r"|home\s+channel\s+is\s+set"
@@ -94,7 +108,9 @@ _NOISY_STATUS_RE = re.compile(
 # carries a technical token (model/provider/stream/retry/api), drop it
 # even if no specific phrase matched. Catches future variants without
 # requiring a regex update each time.
-_STATUS_EMOJI_PREFIX_RE = re.compile(r"^\s*(?:⚠️|⏳|📬|🔄|🔁|❌|⛔|🛑|💥|💾|📝|🧠|🗒️|📋|🔧|⚙️|🔍|🗜️|⟳)")
+_STATUS_EMOJI_PREFIX_RE = re.compile(
+    r"^\s*(?:⚠|ℹ️|ℹ|⚠️|⏳|⏱️|⏱|📬|🔄|🔁|❌|⛔|🛑|💥|💾|📝|🧠|🗒️|📋|🔧|⚙️|🔍|🗜️|🗜|📦|💤|⟳|↻|✓|✔️|✔|☑️|☑)"
+)
 _STATUS_TOKEN_RE = re.compile(
     r"\b(model|provider|stream|streaming|retry|retrying|api|connection|"
     r"timeout|reconnect|backend|chunk|ttfb|abort|fallback)\b",
@@ -182,6 +198,133 @@ def _datamark_user_text(text: str, nonce: str) -> str:
     return f"{open_tag}\n{text}\n{close_tag}"
 
 
+# Non-owner: tin MỞ ĐẦU bằng emoji/ký hiệu → luôn là thông báo Hermes
+# (⚠/ℹ/◐/🔄/💾/🗜...). Reply thật của bot (persona) mở đầu bằng chữ, không emoji.
+_LEADING_EMOJI_RE = re.compile(
+    r"^\s*(?:"
+    r"⚠|ℹ|◐|◑|◒|◓|◆|◇|⏳|⌛|⏱|📬|🔄|🔁|⟳|↻|❌|⛔|🛑|💥|💾|🗜|🧠|🔧|⚙|🔍|📝|🗒|📋|📦|💤"
+    r")️?"
+)
+
+# Hermes lifecycle glyphs that a REAL Vietnamese reply also plausibly opens
+# with ("✔ Đã đặt lịch cho anh", "⚡ Đơn đang giao"). Dropping on the glyph
+# alone would eat legitimate answers, so these only count as a system notice
+# when the text carries no Vietnamese diacritic — i.e. it is raw English
+# runtime output such as "✓ Context compaction complete — continuing turn...".
+_LEADING_EMOJI_EN_ONLY_RE = re.compile(r"^\s*(?:✓|✔|☑|⚡)️?")
+
+
+# Reply thật của bot LUÔN tiếng Việt (ta/con). Đôi khi model lỡ xuất văn bản
+# PLANNING tiếng Anh ("We need... Let's call get latest to inspect...") ra chat.
+_VN_DIACRITIC_RE = re.compile(
+    r"[àáảãạăằắẳẵặâầấẩẫậèéẻẽẹêềếểễệìíỉĩịòóỏõọôồốổỗộơờớởỡợùúủũụưừứửữựỳýỷỹỵđ]",
+    re.IGNORECASE,
+)
+_MODEL_PLANNING_RE = re.compile(
+    r"(?i)(?:let'?s\s+\w+|let\s+me\s+\w+|we\s+(?:need|should|must|can|have\s+to)"
+    r"|i'?ll\s+\w+|i\s+need\s+to|i\s+should|call\s+get|get\s+latest|update\s+fields"
+    r"|maybe\s+enough|possibly\s+forbidden|to\s+inspect|first\s+and\s+html)"
+)
+
+
+# ── Mode bảo trì (owner bật/tắt, tạm dừng toàn bộ agent + tự báo khách) ──
+# State nằm ở <session_dir>/maintenance.json để sống sót qua restart và để
+# tiến trình khác (cron/worker) đọc được cùng một cờ.
+_MAINT_FILENAME = "maintenance.json"
+# Câu mặc định cố ý KHÔNG gắn tên/nhân xưng riêng của bot — persona có thể
+# ghi đè qua bot_persona.json → notices.maintenance, hoặc owner đặt câu riêng
+# bằng `/bot baotri <câu>`.
+_MAINT_DEFAULT_MSG = (
+    "Hệ thống đang được nâng cấp thêm tính năng mới nên tạm nghỉ một chút ạ. "
+    "Sẽ quay lại sớm nhất — mọi người chờ chút rồi nhắn lại giúp nhé, "
+    "xin lỗi vì sự bất tiện 🙏"
+)
+_MAINT_NOTICE_INTERVAL_S = 900  # tối đa 1 thông báo / chat / 15 phút
+
+
+def _maint_file() -> Path:
+    return Path(
+        os.getenv("ZALO_PERSONAL_SESSION_DIR") or "/opt/data/zalo"
+    ) / _MAINT_FILENAME
+
+
+def _get_maintenance() -> Dict[str, Any]:
+    """Đọc cờ bảo trì. Lỗi đọc/parse → coi như TẮT (fail-open, bot vẫn chạy)."""
+    try:
+        f = _maint_file()
+        if f.exists():
+            d = json.loads(f.read_text(encoding="utf-8"))
+            if isinstance(d, dict):
+                return d
+    except Exception as e:
+        logger.warning(f"[zalo-personal] _get_maintenance failed: {e}")
+    return {"enabled": False, "message": ""}
+
+
+def _set_maintenance(enabled: bool, message: str = "") -> bool:
+    try:
+        f = _maint_file()
+        f.parent.mkdir(parents=True, exist_ok=True)
+        f.write_text(
+            json.dumps(
+                {
+                    "enabled": bool(enabled),
+                    "message": message or "",
+                    "set_at": datetime.datetime.now().isoformat(timespec="seconds"),
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+        return True
+    except Exception as e:
+        logger.warning(f"[zalo-personal] _set_maintenance failed: {e}")
+        return False
+
+
+def _maintenance_message() -> str:
+    """Câu gửi khách khi đang bảo trì: owner đặt riêng > persona notice > default."""
+    custom = (_get_maintenance().get("message") or "").strip()
+    if custom:
+        return custom
+    return _persona_notice("maintenance", _MAINT_DEFAULT_MSG)
+
+
+def _maint_message_deliverable(msg: str) -> bool:
+    """True nếu câu bảo trì sống sót qua bộ lọc outbound cho khách thường.
+
+    Câu bảo trì đi thẳng ra khách (không qua LLM); nếu nó mở đầu bằng emoji
+    trạng thái hoặc dính mẫu "thông báo hệ thống" thì send() sẽ drop và khách
+    không nhận được gì. Kiểm tra trước để owner biết mà sửa câu.
+    """
+    try:
+        decision = _classify_outbound(msg, is_owner=False)
+        if decision.action != _FilterAction.KEEP:
+            return False
+        cleaned = _strip_non_owner_internal_noise(decision.cleaned_text)
+        if not cleaned.strip():
+            return False
+        return _scrub_outgoing(cleaned) is not None
+    except Exception:
+        return True
+
+
+# ── Cuộc gọi nhỡ: tự nhắn lại ────────────────────────────────────────────
+# Zalo đẩy log cuộc gọi dưới dạng msgType "chat.recommended" + content.action
+# chứa "call" (…call.miss = gọi nhỡ). Sidecar bóc thành kind="call".
+# Câu mặc định KHÔNG hứa gọi lại — bot chỉ nhắn tin được, hứa gọi lại là nói
+# dối khách. Persona ghi đè qua bot_persona.json → notices.missed_call.
+_MISSED_CALL_DEFAULT_MSG = (
+    "Xin lỗi, kênh Zalo này chỉ nhắn tin nên chưa nghe gọi được ạ. "
+    "Anh/chị nhắn nội dung cần hỗ trợ ở đây giúp nhé, sẽ phản hồi ngay ạ."
+)
+
+
+def _missed_call_message() -> str:
+    return _persona_notice("missed_call", _MISSED_CALL_DEFAULT_MSG)
+
+
 def _scrub_outgoing(text: str) -> Optional[str]:
     """Return cleaned text safe for end-user delivery, or None to drop.
 
@@ -204,8 +347,21 @@ def _scrub_outgoing(text: str) -> Optional[str]:
         return None
     if _STATUS_EMOJI_PREFIX_RE.match(t) and _STATUS_TOKEN_RE.search(t):
         return None
+    # Rule 3: mở đầu bằng emoji/ký hiệu → thông báo Hermes, drop cho khách.
+    if _LEADING_EMOJI_RE.match(t):
+        return None
+    # Rule 3b: glyph dùng chung với câu trả lời thật ("✔ Đã đặt lịch") — chỉ
+    # drop khi KHÔNG có dấu tiếng Việt, tức là text vận hành tiếng Anh.
+    if _LEADING_EMOJI_EN_ONLY_RE.match(t) and not _VN_DIACRITIC_RE.search(t):
+        return None
+    # Rule 4: model reasoning/planning tiếng Anh lọt ra (không có tiếng Việt +
+    # dính >=2 mẫu planning). Reply thật luôn tiếng Việt → an toàn.
+    if not _VN_DIACRITIC_RE.search(t) and len(_MODEL_PLANNING_RE.findall(t)) >= 2:
+        return None
     # Mild brand redaction. Keep the message structure but swap names.
     t = _BRAND_REDACT_RE.sub("trợ lý", t)
+    # Ẩn thương hiệu backend: mọi biến thể "HostBill" → "hitechcloud".
+    t = re.sub(r"(?i)host\s*-?\s*bill", "hitechcloud", t)
     # Che tên chủ tài khoản (TÙY CHỌN): nếu khai báo ZALO_OWNER_NAME, thay
     # mọi biến thể tên đó bằng cách xưng hô (ZALO_OWNER_NICKNAME, mặc định
     # "sếp"). Mặc định KHÔNG khai báo → không che gì.
@@ -214,11 +370,149 @@ def _scrub_outgoing(text: str) -> Optional[str]:
     return t
 
 
+# ---------------------------------------------------------------------------
+# Cron / reminder delivery envelope stripper.
+#
+# When a Hermes cron/reminder job FIRES, core delivers the body wrapped in a
+# technical envelope, e.g.:
+#
+#     Cronjob Response: Nhắc đánh pick
+#     (job_id: 90d5be72fd33)
+#     -------------
+#
+#     Anh ơi tới giờ đánh pick rồi nha 🏓
+#
+#     To stop or manage this job, send me a new message (e.g. "stop reminder Nhắc đánh pick").
+#
+# End users should only ever see the natural-language body. We strip the header
+# (everything up to and including the dashed separator) and the management
+# footer. Applied to ALL outbound text — the home channel is the owner DM, which
+# send() otherwise passes through unscrubbed, so this is the only place the
+# envelope gets cleaned.
+# ---------------------------------------------------------------------------
+_CRON_HEADER_RE = re.compile(
+    r"^\s*Cron(?:job)?\s+Response\s*:.*?\n\s*-{3,}\s*\n",
+    re.IGNORECASE | re.DOTALL,
+)
+_CRON_FOOTER_RE = re.compile(
+    r"\n+\s*To stop or manage this job\b.*$",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+# ── Markdown → plaintext cho Zalo (Zalo KHÔNG render markdown) ──────────────
+# Bot có thể trả lời kèm **bold**, #heading, `code`, [text](url)... Zalo hiện
+# thô các dấu này. Chuyển về text thuần, GIỮ nội dung + link bấm được.
+_MD_FENCE_RE   = re.compile(r"```[^\n]*\n?(.*?)```", re.DOTALL)
+_MD_LINK_RE    = re.compile(r"(!)?\[([^\]]*)\]\(([^)\s]+)(?:\s+\"[^\"]*\")?\)")
+_MD_BOLD_RE    = re.compile(r"\*\*(.+?)\*\*|__(.+?)__", re.DOTALL)
+_MD_STRIKE_RE  = re.compile(r"~~(.+?)~~", re.DOTALL)
+_MD_ITALIC_RE  = re.compile(r"(?<![\*\w])\*(?!\s)(.+?)(?<!\s)\*(?!\*)"
+                            r"|(?<![_\w])_(?!\s)(.+?)(?<!\s)_(?!\w)")
+_MD_CODE_RE    = re.compile(r"`([^`]+)`")
+_MD_HR_RE      = re.compile(r"^\s{0,3}([-*_])(?:\s*\1){2,}\s*$", re.MULTILINE)
+_MD_HEADING_RE = re.compile(r"^\s{0,3}#{1,6}\s+", re.MULTILINE)
+_MD_QUOTE_RE   = re.compile(r"^\s{0,3}>\s?", re.MULTILINE)
+_MD_BULLET_RE  = re.compile(r"^(\s*)[-*+]\s+", re.MULTILINE)
+
+
+def _zalo_plaintext(text: str) -> str:
+    """Chuyển markdown về text thuần cho Zalo. No-op nếu không có ký tự markdown."""
+    if not text or not any(c in text for c in "*_`#[~>"):
+        return text
+    t = _MD_FENCE_RE.sub(lambda m: m.group(1), text)
+    def _link(m):
+        label, url = m.group(2), m.group(3)
+        if m.group(1):
+            return url
+        return f"{label} ({url})" if label and label != url else url
+    t = _MD_LINK_RE.sub(_link, t)
+    t = _MD_BOLD_RE.sub(lambda m: m.group(1) or m.group(2), t)
+    t = _MD_STRIKE_RE.sub(lambda m: m.group(1), t)
+    t = _MD_ITALIC_RE.sub(lambda m: m.group(1) or m.group(2), t)
+    t = _MD_CODE_RE.sub(lambda m: m.group(1), t)
+    t = _MD_HR_RE.sub("", t)
+    t = _MD_HEADING_RE.sub("", t)
+    t = _MD_QUOTE_RE.sub("", t)
+    t = _MD_BULLET_RE.sub(lambda m: f"{m.group(1)}• ", t)
+    t = re.sub(r"\n{3,}", "\n\n", t)
+    return t.strip()
+
+
+# eKYC đã chuyển sang Zalo mini-app (2026-07). Ép MỌI link eKYC cũ
+# (hitechcloud.vn/ekyc/) sang zalo.me — kể cả khi tool MCP trả ekyc_url cũ hoặc
+# phiên còn nạp bản skill cũ. Áp cho mọi chat (owner + khách).
+_EKYC_OLD_RE = re.compile(r"https?://(?:www\.)?hitechcloud\.vn/ekyc/", re.IGNORECASE)
+_EKYC_NEW_BASE = "https://zalo.me/s/1106381038231966057/"
+
+
+def _strip_cron_envelope(text: str) -> str:
+    """Remove the Hermes cron/reminder delivery envelope, keep only the body."""
+    if not text or ("Response" not in text and "job_id" not in text):
+        return text
+    t = _CRON_HEADER_RE.sub("", text, count=1)
+    t = _CRON_FOOTER_RE.sub("", t)
+    return t.strip()
+
+
+_FILE_MUTATION_FOOTER_RE = re.compile(
+    r"\n*⚠️\s*File-mutation verifier:.*?(?=\n\n\S|\Z)",
+    re.IGNORECASE | re.DOTALL,
+)
+_SELF_IMPROVEMENT_REVIEW_RE = re.compile(
+    r"^\s*💾\s*Self-improvement review\s*:.*$",
+    re.IGNORECASE | re.DOTALL,
+)
+# Thông báo 1 lần của core khi gpt-5.5/Codex nâng ngưỡng auto-compaction
+# ("ℹ ... caps context at 272K, so auto-compaction was raised to 85% ...
+# Opt back out: hermes config set compression..."). Thuần thông tin vận
+# hành — KHÔNG được để lọt ra người dùng Zalo. Strip cả khối notice; nếu
+# tin chỉ gồm notice → rỗng → send() drop im lặng (owner DM vẫn giữ).
+_COMPRESSION_AUTORAISE_RE = re.compile(
+    r"(?:^|\n)[ \t]*ℹ?[^\n]*"
+    r"(?:caps context at|auto[- ]?compaction was raised)"
+    r"[^\n]*(?:\n[ \t]*[^\n]+)*",
+    re.IGNORECASE,
+)
+
+
+# Dòng đuôi "Opt back out: hermes config set ..." của thông báo auto-compaction
+# hay bị TÁCH khỏi dòng đầu bởi 1 dòng trống → _COMPRESSION_AUTORAISE_RE bỏ
+# sót. Bắt riêng để strip (thuần vận hành, phải drop im lặng cho khách).
+_COMPRESSION_OPTOUT_RE = re.compile(
+    r"(?im)^[ \t]*Opt back out:[^\n]*hermes\s+config\s+set[^\n]*$"
+)
+
+
+def _strip_non_owner_internal_noise(text: str) -> str:
+    """Remove owner/debug-only Hermes diagnostics from non-owner Zalo replies.
+
+    Owner DM remains untouched. For normal users/groups we keep the natural
+    assistant answer, but strip internal footers like the file-mutation verifier.
+    Standalone background-review notices are dropped silently instead of being
+    converted into a scary technical/error message.
+    """
+    if not text:
+        return text
+    t = text.strip()
+    if _SELF_IMPROVEMENT_REVIEW_RE.match(t):
+        return ""
+    t = _FILE_MUTATION_FOOTER_RE.sub("", text)
+    t = _COMPRESSION_AUTORAISE_RE.sub("", t).strip()
+    t = _COMPRESSION_OPTOUT_RE.sub("", t).strip()
+    return t
+
+
 # ── Cấu hình danh tính chủ tài khoản (tùy chọn, để TRỐNG cho bản chia sẻ) ──
 # ZALO_OWNER_NAME      : tên thật cần che khi bot lỡ nhắc (vd "Nguyễn Văn A")
 # ZALO_OWNER_NICKNAME  : cách xưng hô thay thế (mặc định "sếp")
 # Nếu không khai báo tên → plugin không che danh tính nào.
 _OWNER_NICKNAME = (os.getenv("ZALO_OWNER_NICKNAME") or "sếp").strip()
+# Câu trấn an gửi cho NGƯỜI DÙNG THƯỜNG khi hệ thống trục trặc (thay vì lộ
+# lỗi kỹ thuật hoặc im lặng). Owner (sếp) vẫn nhận đầy đủ chi tiết để xử lý.
+_USER_SOFT_ERROR_NOTICE = (
+    "Anh/chị chờ em chút để em kiểm tra lại nha, em báo lại ngay ạ 🙏"
+)
 _OWNER_NAME = (os.getenv("ZALO_OWNER_NAME") or "").strip()
 
 
@@ -259,6 +553,94 @@ except Exception:  # pragma: no cover
     _mkt = _ilu.module_from_spec(_spec_mkt)
     _spec_mkt.loader.exec_module(_mkt)
 
+# Pure inbound-media contract helpers (magic sniff, path validation,
+# normalization, bounded recent-image index). Same load strategy as marketing.
+try:
+    from . import inbound_media as _inmedia  # type: ignore
+except Exception:  # pragma: no cover
+    import importlib.util as _ilu2
+    _imp = os.path.join(os.path.dirname(os.path.abspath(__file__)), "inbound_media.py")
+    _spec_im = _ilu2.spec_from_file_location("zalo_inbound_media", _imp)
+    _inmedia = _ilu2.module_from_spec(_spec_im)
+    _spec_im.loader.exec_module(_inmedia)
+normalize_inbound_media = _inmedia.normalize_inbound_media
+resolve_media_cache_dir = _inmedia.resolve_media_cache_dir
+RecentImage = _inmedia.RecentImage
+RecentImageIndex = _inmedia.RecentImageIndex
+
+# Server-to-server Zalo→landing image bridge (no base64 through the LLM).
+try:
+    from . import landing_media_bridge as _lbridge  # type: ignore
+except Exception:  # pragma: no cover
+    import importlib.util as _ilu3
+    _lbp = os.path.join(os.path.dirname(os.path.abspath(__file__)), "landing_media_bridge.py")
+    _spec_lb = _ilu3.spec_from_file_location("zalo_landing_media_bridge", _lbp)
+    _lbridge = _ilu3.module_from_spec(_spec_lb)
+    _spec_lb.loader.exec_module(_lbridge)
+_LandingMediaBridge = _lbridge.LandingMediaBridge
+_LandingBridgeError = _lbridge.BridgeError
+_load_landing_bridge_config = _lbridge.load_bridge_config
+
+# SSRF-guarded image fetch cho zalo_send_image(image_url=...) — model đưa 1 url
+# (vd qr_url từ media_store) → tải server-side, không cho base64/URL qua LLM.
+try:
+    from . import image_url_fetch as _imgfetch  # type: ignore
+except Exception:  # pragma: no cover
+    import importlib.util as _ilu4
+    _ifp = os.path.join(os.path.dirname(os.path.abspath(__file__)), "image_url_fetch.py")
+    _spec_if = _ilu4.spec_from_file_location("zalo_image_url_fetch", _ifp)
+    _imgfetch = _ilu4.module_from_spec(_spec_if)
+    _spec_if.loader.exec_module(_imgfetch)
+_fetch_image_from_url = _imgfetch.fetch_image_from_url
+
+# Nhắc động kiểu Osin cho non-owner: scheduler (persist/due/escalation) +
+# compose (LLM toolless + template fallback). Dep-free → load kép như trên.
+try:
+    from . import reminder_scheduler as _rsched  # type: ignore
+    from . import reminder_compose as _rcompose  # type: ignore
+except Exception:  # pragma: no cover
+    import importlib.util as _ilu_rem
+    _rsp = os.path.join(os.path.dirname(os.path.abspath(__file__)), "reminder_scheduler.py")
+    _spec_rs = _ilu_rem.spec_from_file_location("zalo_reminder_scheduler", _rsp)
+    _rsched = _ilu_rem.module_from_spec(_spec_rs)
+    _spec_rs.loader.exec_module(_rsched)
+    _rcp = os.path.join(os.path.dirname(os.path.abspath(__file__)), "reminder_compose.py")
+    _spec_rc = _ilu_rem.spec_from_file_location("zalo_reminder_compose", _rcp)
+    _rcompose = _ilu_rem.module_from_spec(_spec_rc)
+    _spec_rc.loader.exec_module(_rcompose)
+_ImageUrlError = _imgfetch.ImageUrlError
+_resolve_image_allowed_hosts = _imgfetch.resolve_allowed_hosts
+
+# Segment-aware outbound classifier (hide lifecycle/context diagnostics, keep
+# the real answer) + bounded terminal-recovery limiter.
+try:
+    from . import message_filtering as _msgfilter  # type: ignore
+except Exception:  # pragma: no cover
+    import importlib.util as _ilu4
+    _mfp = os.path.join(os.path.dirname(os.path.abspath(__file__)), "message_filtering.py")
+    _spec_mf = _ilu4.spec_from_file_location("zalo_message_filtering", _mfp)
+    _msgfilter = _ilu4.module_from_spec(_spec_mf)
+    _spec_mf.loader.exec_module(_msgfilter)
+_classify_outbound = _msgfilter.classify
+_FilterAction = _msgfilter.FilterAction
+_RECOVERY_LIMITER = _msgfilter.RecoveryNoticeLimiter(ttl=300.0, max_size=500)
+
+
+def _chat_hash(chat_id: Any) -> str:
+    """Short, non-reversible chat identifier for structured logs (never raw id)."""
+    import hashlib as _hl
+    return _hl.sha256(str(chat_id or "").encode("utf-8")).hexdigest()[:10]
+
+
+def _persona_notice(key: str, default: str) -> str:
+    """Canned notice theo persona (bot_persona.json → notices{key}), fallback
+    câu mặc định. Dùng cho các dòng đi thẳng ra khách KHÔNG qua LLM — để bot
+    xưng hô đúng giọng persona (vd Ông Bụt: ta/con) thay vì em/anh chị cứng."""
+    try:
+        return _msgfilter.resolve_notice(_load_bot_persona(), key, default)
+    except Exception:
+        return default
+
 _MKT_STORE = None
 _MKT_CLIENT = None
 # uid người được @tag gần nhất theo từng chat (cho zalo_friend_add/send_dm
@@ -266,7 +648,150 @@ _MKT_CLIENT = None
 _LAST_MENTIONS: Dict[str, List[str]] = {}
 # Đường dẫn file ảnh sếp (owner) vừa gửi cho bot (để nhắn marketing kèm ảnh
 # "mấy ảnh em vừa gửi"). Giữ tối đa 10 ảnh gần nhất.
+# ── hitechcloud-hosted media images (QR chuyển khoản / invoice) ──
+# get_payment_qr / addfunds_qr (MCP hitechcloud) trả QR dưới dạng *link* tới file PNG
+# host sẵn (https://mcp.hitechcloud.vn/media/<key>.png), KHÔNG phải MCP ImageContent
+# block — nên auto "ImageContent -> MEDIA:" của Hermes không kích hoạt, bot đành
+# dán link thô. Ta chặn các link ảnh hitechcloud ở outbound và gửi thành ảnh native.
+_hitechcloud_MEDIA_IMG_RE = re.compile(
+    'https?://(?:[\\w.-]+\\.)?hitechcloud\\.vn/media/[\\w./-]+?\\.(?:png|jpe?g|webp|gif)(?:\\?[^\\s]*)?',
+    re.IGNORECASE,
+)
+
+
+def _extract_hitechcloud_media_images(text: str) -> List[str]:
+    """De-duplicated, order-preserving list of hitechcloud media image URLs."""
+    if not text or "hitechcloud.vn/media/" not in text.lower():
+        return []
+    seen: set = set()
+    out: List[str] = []
+    for m in _hitechcloud_MEDIA_IMG_RE.finditer(text):
+        url = m.group(0).rstrip(".,;)")
+        if url not in seen:
+            seen.add(url)
+            out.append(url)
+    return out
+
+
+def _strip_media_urls(text: str, urls: List[str]) -> str:
+    """Remove *urls* + dangling markdown wrappers, tidy whitespace."""
+    cleaned = text
+    for url in urls:
+        cleaned = cleaned.replace(url, "")
+    cleaned = re.sub(r"!?\[[^\]]*\]\(\s*\)", "", cleaned)
+    cleaned = re.sub(r"[ \t]+\n", "\n", cleaned)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    return cleaned.strip()
+
+
 _LAST_OWNER_IMAGES: List[str] = []
+# Ảnh GẦN NHẤT theo từng chat (MỌI người gửi, không chỉ owner) → tool
+# zalo_read_recent_image cho bot "đọc" lại ảnh khi được hỏi "hình vừa gửi
+# nói gì". Bounded, namespaced theo (self_uid, chat_id); dedupe theo msg_id;
+# thứ tự theo (event_ts, ingress_seq) — KHÔNG theo thứ tự download hoàn tất.
+# Chỉ populate SAU authorization (không cho sender bị deny làm nhiễm cache).
+_RECENT_IMAGES = RecentImageIndex(per_chat=5, max_chats=200)
+
+
+def _capture_recent_image(event: Dict[str, Any], from_uid: str, local_path: str,
+                          mime_type: Optional[str]) -> None:
+    """Add an AUTHORIZED, magic-validated inbound image to the recent-image
+    index. Called only after authorization + system/synthetic gates, so a
+    denied sender or a Zalo system message can never poison the cache."""
+    try:
+        chat_id = str(event.get("thread_id") or from_uid)
+        seq = int(event.get("ingress_seq") or 0)
+        msg_id = str(event.get("msg_id") or f"{chat_id}:{seq}")
+        _RECENT_IMAGES.add(chat_id, RecentImage(
+            msg_id=msg_id,
+            local_path=str(local_path),
+            from_uid=str(from_uid),
+            from_name=str(event.get("from_name") or ""),
+            event_ts=float(event.get("ts") or 0),
+            ingress_seq=seq,
+            mime_type=mime_type,
+            caption="",
+        ))
+    except Exception:
+        logger.debug("[zalo-personal] recent-image capture failed", exc_info=True)
+# Cache giới tính theo uid (tra 1 lần qua sidecar getUserInfo) → bot xưng hô
+# "anh/chị" đúng thay vì phỏng đoán theo tên. value: "male"|"female"|"unknown".
+_USER_GENDER_CACHE: Dict[str, str] = {}
+
+
+def _lookup_user_gender(uid: str) -> str:
+    """Tra giới tính công khai của 1 uid qua sidecar getUserInfo (cache lại).
+
+    Zalo Gender enum: 0=Male, 1=Female. Trả 'male'|'female'|'unknown'.
+    Best-effort: lỗi/ẩn thì trả 'unknown', không chặn luồng tin."""
+    uid = str(uid or "")
+    if not uid:
+        return "unknown"
+    if uid in _USER_GENDER_CACHE:
+        return _USER_GENDER_CACHE[uid]
+    result = "unknown"
+    try:
+        r = _post_sidecar_api("getUserInfo", [uid], timeout=12)
+        data = r.get("result") or {}
+        # getUserInfo trả {changed_profiles: {uid: {gender,...}}} hoặc profile thẳng.
+        prof = None
+        if isinstance(data, dict):
+            cont = data.get("changed_profiles") or data.get("unchanged_profiles") or {}
+            if isinstance(cont, dict) and cont:
+                prof = cont.get(uid) or cont.get(f"{uid}_0") or next(iter(cont.values()), None)
+            if prof is None:
+                prof = data if "gender" in data else None
+        if isinstance(prof, dict) and prof.get("gender") is not None:
+            result = "male" if int(prof.get("gender")) == 0 else "female"
+    except Exception as e:
+        logger.debug(f"[zalo-personal] lookup gender uid={uid} lỗi: {e}")
+    _USER_GENDER_CACHE[uid] = result
+    return result
+
+
+# Quy tắc KHÔNG trả lời dữ liệu THÔ / NỘI BỘ ra chat. Áp cho cả owner lẫn
+# non-owner: profile Zalo, ID kỹ thuật, JSON tool output... chỉ dùng nội bộ
+# để bot hành xử tự nhiên, không đọc nguyên văn như đang tra cứu hệ thống.
+# Zalo gender chỉ có 2 giá trị: 0=Nam, 1=Nữ.
+_PROFILE_USAGE_RULE = (
+    "\n\n═══ QUY TẮC KHÔNG ĐỌC DỮ LIỆU THÔ RA CHAT ═══\n"
+    "Mọi dữ liệu kỹ thuật/nội bộ CHỈ để em hiểu ngữ cảnh & hành xử tự nhiên — "
+    "KHÔNG bao giờ đọc nguyên văn ra cho người dùng. Cụ thể:\n"
+    "• Profile Zalo (giới tính, ngày sinh...): chỉ dùng để chọn cách xưng hô "
+    "(anh/chị). KHÔNG nói 'gender = 0', 'profile có trường giới tính', 'ngày "
+    "sinh 21/04/2001' — nghe như tra hồ sơ, rất kỳ. Zalo gender CHỈ có 0=Nam, "
+    "1=Nữ; KHÔNG suy diễn/bình luận gì ngoài dữ liệu này (xu hướng tính dục, "
+    "'khả năng là...', v.v.). Profile không có thông tin gì → nói gọn 'cái đó "
+    "profile không có ạ', KHÔNG đoán mò. Ẩn giới tính → xưng hô trung tính "
+    "theo tên hoặc 'bạn'.\n"
+    "• ID kỹ thuật (uid, group_id, msg_id, cli_msg_id, thread_id, cache_key, "
+    "đường dẫn file, tên tool, port, log...): KHÔNG đưa ra chat trừ khi CHÍNH "
+    "SẾP yêu cầu rõ. Với người dùng thường → tuyệt đối không.\n"
+    "• Kết quả tool trả về (JSON, dict, 'success=true', raw=...): KHÔNG paste "
+    "nguyên văn. Đọc xong tự diễn đạt lại bằng lời tự nhiên, ngắn gọn (vd "
+    "'Dạ tạo poll xong rồi nha'), KHÔNG khoe id/raw/field.\n"
+    "• ĐẶC BIỆT lịch nhắc / cron / reminder / scheduled task: SAU khi đặt "
+    "lịch thành công TUYỆT ĐỐI KHÔNG đọc ra 'Cronjob response', 'job_id', "
+    "'schedule', cron expression, JSON hay bất kỳ field kỹ thuật nào. Chỉ "
+    "xác nhận bằng lời tự nhiên kèm thời điểm + việc cần nhắc, vd 'Dạ em "
+    "đặt nhắc 9h sáng mai họp team rồi nha sếp' / 'Ok để em nhắc anh uống "
+    "thuốc lúc 8h tối nay'. Nếu lỗi → nói gọn 'Dạ tạo lịch chưa được, sếp "
+    "thử lại giúp em', KHÔNG dán log lỗi.\n"
+    "═════════════════════════════════════════════"
+)
+
+
+def _gender_hint(gender: str, user_name: str) -> str:
+    """Câu nhắc xưng hô dựa trên giới tính CÔNG KHAI (Zalo). Trống nếu ẩn.
+
+    Zalo gender: 0=Nam, 1=Nữ — chỉ 2 giá trị này, không có gì khác."""
+    if gender == "male":
+        return (f" Giới tính Zalo của họ là Nam → xưng hô \"anh {user_name}\" "
+                f"(KHÔNG nói ra 'gender=0' hay dữ liệu thô).")
+    if gender == "female":
+        return (f" Giới tính Zalo của họ là Nữ → xưng hô \"chị {user_name}\" "
+                f"(KHÔNG nói ra 'gender=1' hay dữ liệu thô).")
+    return ""
 
 
 def _mk_store():
@@ -296,6 +821,21 @@ class ZaloPersonalAdapter(BasePlatformAdapter):
         super().__init__(config=config, platform=platform)
 
         extra = getattr(config, "extra", {}) or {}
+
+        # ── Debounce tin nhắn đến (gom 2-3 tin gửi liên tiếp → 1 lượt trả lời) ──
+        # Khi khách gửi nhiều tin TEXT thuần cùng thread trong khoảng im lặng
+        # ngắn, gom text lại rồi mới đẩy 1 MessageEvent cho agent — tránh trả
+        # lời tách rời từng tin. Chỉ áp cho tin text (media/ảnh xử lý ngay).
+        # Window có thể chỉnh qua env ZALO_PERSONAL_INBOUND_DEBOUNCE_SECONDS.
+        try:
+            self._inbound_debounce_seconds = float(
+                os.getenv("ZALO_PERSONAL_INBOUND_DEBOUNCE_SECONDS") or 3.0
+            )
+        except (TypeError, ValueError):
+            self._inbound_debounce_seconds = 3.0
+        # per-thread: {thread_id: {"event": MessageEvent, "texts": [str],
+        #              "task": asyncio.Task}}
+        self._inbound_debounce: Dict[str, Dict[str, Any]] = {}
 
         self.sidecar_port = int(os.getenv("ZALO_PERSONAL_SIDECAR_PORT") or extra.get("sidecar_port", 3838))
         self.sidecar_url = f"http://127.0.0.1:{self.sidecar_port}"
@@ -349,6 +889,13 @@ class ZaloPersonalAdapter(BasePlatformAdapter):
         else:
             rm_val = rm_env.lower() in ("1", "true", "yes", "on")
         self.require_mention = bool(rm_val)
+        # Name triggers — biệt danh gọi bot trong nhóm (ngoài @tag/reply-to-bot,
+        # persona name). Bổ sung vào alias trong _is_self_mentioned. Comma-sep,
+        # khớp substring không phân biệt hoa/thường. Rỗng = chỉ dùng persona name.
+        self.name_triggers = _msgfilter.parse_name_triggers(
+            os.getenv("ZALO_PERSONAL_NAME_TRIGGERS")
+            or extra.get("name_triggers", "")
+        )
         # Group senders allowlist (Zalo UIDs). Empty = every member.
         raw_gallow_from = (
             os.getenv("ZALO_PERSONAL_GROUP_ALLOW_FROM")
@@ -419,6 +966,11 @@ class ZaloPersonalAdapter(BasePlatformAdapter):
         self._sent_msg_ids: List[str] = []
         self._sent_msg_ids_max = 500
 
+        # Mode bảo trì: chat_id -> epoch lần cuối gửi thông báo (RL 15').
+        self._maint_notified: Dict[str, float] = {}
+        # Cuộc gọi nhỡ: chat_id -> epoch lần cuối tự nhắn lại.
+        self._missed_call_notified: Dict[str, float] = {}
+
         # Map ``message_id`` (string we expose to Hermes) → full quote
         # payload (zca-js SendMessageQuote shape) for the most recent
         # received messages. Lets adapter.send() honour ``reply_to=<msg_id>``
@@ -447,6 +999,56 @@ class ZaloPersonalAdapter(BasePlatformAdapter):
         # once per group per session (lazy, on first activity) to avoid
         # hammering Zalo's API.
         self._group_members_synced: set = set()
+
+        # Groups the bot has already greeted after being added (persisted so a
+        # gateway restart / group_event replay doesn't re-send the welcome).
+        self._greeted_groups_path = Path(
+            os.getenv("ZALO_PERSONAL_SESSION_DIR") or "/opt/data/zalo"
+        ) / "greeted_groups.json"
+        self._greeted_groups: set = self._load_greeted_groups()
+        # Feature flag: auto-greet when added to a group (default on).
+        self._group_greeting_enabled = (
+            os.getenv("ZALO_PERSONAL_GROUP_GREETING", "true").strip().lower()
+            in ("1", "true", "yes", "on")
+        )
+
+        # Người lạ DM bot → tự gửi lời mời kết bạn. Persist uid đã mời để
+        # restart không mời lại (Zalo coi mời trùng là spam → rủi ro khoá).
+        self._auto_friend_path = Path(
+            os.getenv("ZALO_PERSONAL_SESSION_DIR") or "/opt/data/zalo"
+        ) / "auto_friend_requested.json"
+        self._auto_friend_requested: set = self._load_auto_friend_requested()
+        # uid đang trong quá trình mời (giữa 2 await) — chặn 2 tin đến gần nhau
+        # cùng lọt qua vòng kiểm tra và sinh 2 lời mời.
+        self._auto_friend_inflight: set = set()
+        self._auto_friend_enabled = (
+            os.getenv("ZALO_PERSONAL_AUTO_FRIEND_ON_DM", "true").strip().lower()
+            in ("1", "true", "yes", "on")
+        )
+        # Lời nhắn kèm lời mời. Bỏ trống = mời không kèm lời nhắn.
+        self._auto_friend_msg = os.getenv(
+            "ZALO_PERSONAL_AUTO_FRIEND_MSG", "Mình kết bạn để tiện hỗ trợ nhé!"
+        ).strip()
+        # Cuộc gọi nhỡ → tự nhắn lại (bot không nghe/gọi được).
+        self._missed_call_reply = (
+            os.getenv("ZALO_PERSONAL_MISSED_CALL_REPLY", "true").strip().lower()
+            in ("1", "true", "yes", "on")
+        )
+        # Mặc định CHỈ DM: cuộc gọi nhóm ai cũng bấm được, trả lời trong nhóm
+        # dễ thành spam.
+        self._missed_call_in_groups = (
+            os.getenv("ZALO_PERSONAL_MISSED_CALL_IN_GROUPS", "false").strip().lower()
+            in ("1", "true", "yes", "on")
+        )
+        try:
+            self._missed_call_interval_s = float(
+                os.getenv("ZALO_PERSONAL_MISSED_CALL_INTERVAL_S", "600")
+            )
+        except ValueError:
+            self._missed_call_interval_s = 600.0
+        # Cache danh bạ (uid) để không gọi /friends/all mỗi tin nhắn.
+        self._friend_uids: set = set()
+        self._friend_uids_ts: float = 0.0
 
         # Sidecar bootstrap
         self.sidecar_dir = Path(__file__).parent / "sidecar"
@@ -563,7 +1165,7 @@ class ZaloPersonalAdapter(BasePlatformAdapter):
 
     # ── Lifecycle ──────────────────────────────────────────────────────────
 
-    async def connect(self) -> bool:
+    async def connect(self, *, is_reconnect: bool = False) -> bool:
         """Spawn sidecar if needed, connect WebSocket, listen for messages."""
         if not self.owner_uid:
             logger.error("[zalo-personal] ZALO_PERSONAL_OWNER_UID required")
@@ -589,6 +1191,28 @@ class ZaloPersonalAdapter(BasePlatformAdapter):
 
         logger.info(f"[zalo-personal] sidecar connected, uid={health.get('uid')}")
         self._self_uid = str(health.get("uid") or "")
+        # Bind the recent-image index to this account; clears any stale images
+        # from a previously-connected account (hot reload / account change).
+        try:
+            _RECENT_IMAGES.set_account(self._self_uid)
+        except Exception:
+            logger.debug("[zalo-personal] recent-image set_account failed", exc_info=True)
+
+        # Fail closed if the sidecar's resolved media-cache root disagrees with
+        # the adapter's — otherwise valid local images get rejected as path
+        # escapes later. Both must resolve to the same directory.
+        try:
+            _sidecar_root = str(health.get("media_cache_dir") or "").rstrip("/")
+            _adapter_root = str(resolve_media_cache_dir()).rstrip("/")
+            if _sidecar_root and os.path.realpath(_sidecar_root) != os.path.realpath(_adapter_root):
+                logger.error(
+                    "[zalo-personal] media-cache root MISMATCH: sidecar=%s adapter=%s — "
+                    "set ZALO_PERSONAL_SESSION_DIR identically for both processes.",
+                    _sidecar_root, _adapter_root,
+                )
+                return False
+        except Exception:
+            logger.debug("[zalo-personal] media-cache root check failed", exc_info=True)
 
         try:
             import websockets  # noqa: F401
@@ -602,6 +1226,12 @@ class ZaloPersonalAdapter(BasePlatformAdapter):
         # Vòng nền nhỏ giọt cho phễu marketing (kết bạn / nhắn tin theo hàng
         # đợi đã duyệt, rải đều 24h, tôn trọng hạn mức/ngày).
         self._mkt_drip_task = asyncio.create_task(self._marketing_drip_loop())
+        # Vòng nền cho nhắc ĐỘNG non-owner: tới giờ bắn tin chat + tag. State
+        # persist trên đĩa → sống qua restart (reload ở đầu vòng). Guard tránh
+        # tạo 2 loop nếu connect() được gọi lại mà chưa disconnect (double-fire).
+        _rt = getattr(self, "_reminder_tick_task", None)
+        if _rt is None or _rt.done():
+            self._reminder_tick_task = asyncio.create_task(self._reminder_tick_loop())
         # Kick off group history backfill in background — doesn't block
         # gateway startup. Skips silently if no groups have been seen yet.
         if os.getenv("ZALO_PERSONAL_BACKFILL_ON_START", "true").lower() in (
@@ -924,6 +1554,73 @@ class ZaloPersonalAdapter(BasePlatformAdapter):
                 logger.warning(f"[zalo-mkt] drip loop: {e}")
             await asyncio.sleep(60)
 
+    def _reminder_block_names(self) -> list:
+        """Tên/nickname sếp để defang khỏi nhắc non-owner (không cho tag sếp
+        theo lịch). _build_outbound_mentions còn resolve owner_user_display →
+        chặn cả tên đó."""
+        names = []
+        for nm in (
+            getattr(self, "owner_user_display", ""),
+            _OWNER_NAME,
+            _OWNER_NICKNAME,
+        ):
+            nm = nm.strip() if isinstance(nm, str) else ""
+            if nm and nm not in names:
+                names.append(nm)
+        return names
+
+    async def _reminder_llm_call(self, messages):
+        """Completion TOOLLESS quanh core Hermes async_call_llm (import lazy).
+        KHÔNG agent, KHÔNG tool → không thể chạm tool nguy hiểm/tự sinh nhắc.
+        Lỗi/aux thiếu → raise → compose tự fallback template."""
+        from agent.auxiliary_client import async_call_llm  # lazy: chỉ khi nổ
+        return await async_call_llm(
+            messages=messages, temperature=0.7, max_tokens=300, timeout=30,
+        )
+
+    async def _reminder_tick_loop(self):
+        """Mỗi ~30s bắn các nhắc động tới giờ (tin chat + tag). State persist →
+        sống qua restart. 1 reminder lỗi KHÔNG làm chết vòng lặp. Quá hạn >30'
+        (offline) → bỏ, tránh spam burst khi gateway vừa bật lại."""
+        path = _rsched.state_path()
+        grace = 1800.0
+        await asyncio.sleep(15)  # trễ khởi động cho sidecar ổn định
+        while not self._stop:
+            try:
+                now = time.time()
+                state = _rsched.load(path)
+                for rec in _rsched.due(state, now):
+                    rid = rec.get("id")
+                    advanced = False
+                    try:
+                        if _rsched.is_overdue(rec, now, grace):
+                            logger.info(
+                                f"[zalo-reminder] bỏ nhắc quá hạn {rid} "
+                                f"(trễ >{int(grace)}s, gateway offline)"
+                            )
+                            _rsched.advance(path, rid)
+                            continue
+                        text = await _rcompose.compose(rec, now, self._reminder_llm_call)
+                        # Chặn non-owner ping cả nhóm (@All) / tag sếp theo lịch,
+                        # kể cả khi lọt qua field task (injection).
+                        text = _rcompose.defang_mentions(text, self._reminder_block_names())
+                        # advance TRƯỚC khi gửi → gửi lỗi cũng không re-fire spam.
+                        _rsched.advance(path, rid)
+                        advanced = True
+                        if text and text.strip():
+                            # send() tự lọc (_scrub_outgoing + redaction) + build @mention
+                            await self.send(str(rec.get("chat_id")), text)
+                    except Exception as e:
+                        logger.warning(f"[zalo-reminder] fire {rid} lỗi: {e}")
+                        if not advanced:
+                            try:
+                                _rsched.advance(path, rid)
+                            except Exception:
+                                pass
+            except Exception as e:
+                logger.warning(f"[zalo-reminder] tick loop: {e}")
+            await asyncio.sleep(30)
+
     async def _mk_maybe_autoaccept(self, event: Dict[str, Any]):
         """Khi bật auto_accept: cố trích uid người gửi lời mời từ payload
         friend_event và chấp nhận. Payload zca-js không cố định nên dò
@@ -968,6 +1665,12 @@ class ZaloPersonalAdapter(BasePlatformAdapter):
             except Exception as e:
                 logger.debug(f"[zalo-mkt] autoaccept lỗi: {e}")
             return
+        if et == "group_event":
+            try:
+                await self._handle_group_event(event)
+            except Exception as e:
+                logger.debug(f"[zalo-personal] group_event lỗi: {e}")
+            return
         if et != "message":
             # ignore login_state, error, typing... for now
             return
@@ -987,16 +1690,10 @@ class ZaloPersonalAdapter(BasePlatformAdapter):
                 _LAST_MENTIONS[str(event.get("thread_id") or "")] = _ment
         except Exception:
             pass
-        # Bắt ảnh SẾP (owner) gửi cho bot → dùng cho nhắn marketing kèm ảnh.
-        try:
-            _c = event.get("content") or {}
-            if (isinstance(_c, dict) and _c.get("kind") == "image" and _c.get("local_path")
-                    and self.owner_uid and str(from_uid) == str(self.owner_uid)):
-                _LAST_OWNER_IMAGES.append(str(_c["local_path"]))
-                del _LAST_OWNER_IMAGES[:-10]  # giữ 10 ảnh gần nhất
-                logger.warning(f"[zalo-mkt-diag] bắt ảnh owner: {_c['local_path']} (tổng {len(_LAST_OWNER_IMAGES)})")
-        except Exception:
-            pass
+        # LƯU Ý: việc bắt ảnh gần nhất (recent-image index + owner images) đã
+        # được CHUYỂN XUỐNG SAU authorization + system/synthetic filters
+        # (xem _maybe_capture_recent_image trong nhánh xử lý ảnh) để sender bị
+        # deny / tin hệ thống KHÔNG thể làm nhiễm cache dùng cho landing upload.
         # Bỏ qua tin HỆ THỐNG của Zalo (nhắc lịch/reminder, thông báo poll,
         # sự kiện nhóm...). Người gửi hiển thị là "Zalo" → KHÔNG phải người
         # thật; nếu xử lý, bot sẽ reply vào reminder và tưởng nhầm có "chị
@@ -1108,6 +1805,11 @@ class ZaloPersonalAdapter(BasePlatformAdapter):
             ):
                 logger.info(f"[zalo-personal] ignored DM from non-allowed uid={from_uid}")
                 return
+            # Người lạ (chưa có trong danh bạ) nhắn tin → tự gửi lời mời kết bạn.
+            # Chạy NỀN: không chặn đường trả lời tin (gọi /friends/all + API mời
+            # có thể mất vài giây).
+            if self._auto_friend_enabled and from_uid != self.owner_uid:
+                asyncio.create_task(self._maybe_auto_friend_request(from_uid))
             # listen_only in a DM: skip reply but still observe.
             if chat_mode == "listen_only":
                 logger.debug(
@@ -1153,20 +1855,29 @@ class ZaloPersonalAdapter(BasePlatformAdapter):
                 text = f"{text}\n[Link đính kèm: {href}]" if text else f"[Link: {href}]"
         elif kind == "image":
             text = (content.get("title") or "").strip()
-            local_path = content.get("local_path")
-            if local_path:
-                media_urls.append(str(local_path))
-                media_types.append("image")
+            # Validate the cached path is inside the media-cache root and confirm
+            # the bytes really are an image (magic). media_types carries the REAL
+            # MIME (image/jpeg…) so Hermes routes to native vision, not "image".
+            media = normalize_inbound_media(content, resolve_media_cache_dir())
+            if media.is_image and media.local_path:
+                media_urls.append(media.local_path)
+                media_types.append(media.mime_type or "")
                 message_type = MessageType.PHOTO
+                _capture_recent_image(event, from_uid, media.local_path, media.mime_type)
                 # Nếu CHÍNH SẾP (owner) gửi ảnh: nhắc agent rằng ảnh đã được
                 # lưu và có thể GỬI LẠI cho người khác — để agent biết dùng
                 # use_last_images=true (nếu không sẽ chỉ gửi text, thiếu ảnh).
                 if self.owner_uid and str(from_uid) == str(self.owner_uid):
+                    _LAST_OWNER_IMAGES.append(media.local_path)
+                    del _LAST_OWNER_IMAGES[:-10]  # giữ 10 ảnh gần nhất
                     text = (text + "\n\n[Hệ thống cho trợ lý: sếp vừa đính kèm 1 ảnh (đã lưu sẵn). "
                             "Nếu sếp muốn GỬI ẢNH NÀY cho ai đó, gọi zalo_send_dm (1 người) hoặc "
                             "zalo_marketing_send (nhiều người) với use_last_images=true — KHÔNG cần link ảnh.]").strip()
             else:
-                logger.warning(f"[zalo-personal] image msg without local_path: {content}")
+                logger.warning(
+                    "[zalo-personal] image msg without usable local image (reason=%s)",
+                    getattr(media, "reason", None),
+                )
                 text = text or "[ảnh không tải được]"
         elif kind == "voice":
             local_path = content.get("local_path")
@@ -1181,6 +1892,13 @@ class ZaloPersonalAdapter(BasePlatformAdapter):
                 message_type = MessageType.VOICE
             else:
                 text = "[voice không tải được]"
+        elif kind == "call":
+            # Log cuộc gọi — không có nội dung cho agent. Xử lý tại chỗ rồi
+            # dừng: đẩy tiếp chỉ tổ khiến bot trả lời một tin rỗng.
+            await self._handle_call_event(
+                content, thread_id, from_uid, is_group, chat_mode
+            )
+            return
         elif kind == "file":
             fname = content.get("filename") or "file"
             size = content.get("bytes") or content.get("size") or 0
@@ -1192,6 +1910,18 @@ class ZaloPersonalAdapter(BasePlatformAdapter):
             elif content.get("too_large"):
                 text = f"[file '{fname}' quá lớn (>50MB) — không tải vì an toàn/hiệu năng]"
                 local_path = None
+            # Defense in depth: a photo delivered as a Zalo File (fileUrl) whose
+            # bytes are a real image is routed to vision, not treated as a
+            # document. (The sidecar already reclassifies; this also covers an
+            # older sidecar.)
+            _file_media = normalize_inbound_media(content, resolve_media_cache_dir()) if local_path else None
+            if _file_media is not None and _file_media.is_image and _file_media.local_path:
+                media_urls.append(_file_media.local_path)
+                media_types.append(_file_media.mime_type or "")
+                message_type = MessageType.PHOTO
+                _capture_recent_image(event, from_uid, _file_media.local_path, _file_media.mime_type)
+                text = (content.get("title") or content.get("caption") or "").strip()
+                local_path = None  # handled as image; skip the document branch
             if local_path:
                 media_urls.append(str(local_path))
                 media_types.append("file")
@@ -1236,6 +1966,33 @@ class ZaloPersonalAdapter(BasePlatformAdapter):
             logger.info(f"[zalo-personal] unknown content kind={kind}, skipping")
             return
 
+        # Ảnh trong tin ĐƯỢC QUOTE (user reply vào một tin có ảnh): sidecar
+        # đã tải về local (quote.image.local_path) — đính vào media để model
+        # NHÌN THẤY ảnh đang được nhắc tới khi trả lời.
+        try:
+            _q = event.get("quote") or {}
+            _q_img = (_q.get("image") or {}) if isinstance(_q, dict) else {}
+            # Route the quoted image through the same validation contract as a
+            # direct image so it gets a real MIME and a root-checked local path.
+            _q_media = normalize_inbound_media(
+                {"kind": "image",
+                 "local_path": _q_img.get("local_path"),
+                 "mime_type": _q_img.get("mime_type")},
+                resolve_media_cache_dir(),
+            ) if isinstance(_q_img, dict) and _q_img.get("local_path") else None
+            if _q_media is not None and _q_media.is_image and _q_media.local_path:
+                media_urls.append(_q_media.local_path)
+                media_types.append(_q_media.mime_type or "")
+                if message_type == MessageType.TEXT:
+                    message_type = MessageType.PHOTO
+                _q_note = (
+                    "[Người dùng đang REPLY vào một tin có ẢNH — ảnh đó đã được "
+                    "đính kèm trong media của tin này, hãy nhìn ảnh khi trả lời.]"
+                )
+                text = f"{text}\n\n{_q_note}".strip() if text else _q_note
+        except Exception as _qe:
+            logger.debug(f"[zalo-personal] quote image attach failed: {_qe}")
+
         if not text and not media_urls:
             return
 
@@ -1245,12 +2002,17 @@ class ZaloPersonalAdapter(BasePlatformAdapter):
         #           /bot status
         #           /bot help
         # Only the owner can use these.
+        # Strip a leading @BotName first: in a group the owner has to mention
+        # the bot for it to react at all under the default mention_only mode,
+        # so the natural way to issue a command is "@Bot /bot status" — which
+        # does not start with "/bot" and used to fall through to the agent.
+        _cmd_text = self._strip_self_mention(text, content) if isinstance(text, str) else text
         if (
             from_uid == self.owner_uid
-            and isinstance(text, str)
-            and text.strip().lower().startswith("/bot")
+            and isinstance(_cmd_text, str)
+            and _cmd_text.strip().lower().startswith("/bot")
         ):
-            reply = self._handle_owner_command(text.strip(), thread_id, is_group)
+            reply = self._handle_owner_command(_cmd_text.strip(), thread_id, is_group)
             if reply is not None:
                 await self.send(thread_id, reply)
                 return
@@ -1283,17 +2045,19 @@ class ZaloPersonalAdapter(BasePlatformAdapter):
             #   active       → trigger every msg (no mention required)
             #   sales_active → trigger every msg; sales-mode prompt steers
             #                  the agent to reply selectively + suggest products
-            #   mention_only → @mention / reply-to-bot only
+            #   active_mention_only → observe all msgs, trigger only when
+            #                  @mentioned / name-mentioned / reply-to-bot
+            #   mention_only → @mention / name-mention / reply-to-bot only
             #   listen_only  → never trigger (observe only)
-            #   default      → @mention / reply-to-bot only (safe default)
+            #   default      → @mention / name-mention / reply-to-bot only (safe default)
             if chat_mode in ("active", "sales_active"):
                 triggered = True
             elif chat_mode == "listen_only":
                 triggered = False
-            else:  # mention_only or default
+            else:  # active_mention_only, mention_only or default
                 triggered = is_mentioned or is_reply_to_bot
             if not triggered:
-                if self.observe_unmentioned:
+                if self.observe_unmentioned or chat_mode == "active_mention_only":
                     await self._observe_group_message(
                         text=text,
                         from_uid=from_uid,
@@ -1311,6 +2075,29 @@ class ZaloPersonalAdapter(BasePlatformAdapter):
                 return
             if is_mentioned:
                 text = self._strip_self_mention(text, content)
+
+        # ── Mode bảo trì: khách nhắn → tự trả thông báo, KHÔNG đẩy qua agent.
+        # Owner được bypass để còn tắt được mode. Đặt SAU trigger-gate nên
+        # tin trong nhóm không tag bot vẫn im lặng như thường; mỗi chat tối
+        # đa 1 thông báo / _MAINT_NOTICE_INTERVAL_S giây.
+        if from_uid != self.owner_uid and _get_maintenance().get("enabled"):
+            now = time.time()
+            if now - self._maint_notified.get(thread_id, 0.0) > _MAINT_NOTICE_INTERVAL_S:
+                if len(self._maint_notified) > 500:  # bounded: dọn chat đã hết RL
+                    self._maint_notified = {
+                        k: v for k, v in self._maint_notified.items()
+                        if now - v <= _MAINT_NOTICE_INTERVAL_S
+                    }
+                self._maint_notified[thread_id] = now
+                try:
+                    await self.send(thread_id, _maintenance_message())
+                except Exception as e:
+                    logger.warning(f"[zalo-personal] maintenance notice failed: {e}")
+            logger.info(
+                f"[zalo-personal] maintenance mode — auto-notice, skip agent "
+                f"from={from_uid} chat={thread_id}"
+            )
+            return
 
         # ── Defense-in-depth against prompt injection ──────────────────
         # For every non-owner message, apply datamarking spotlight: wrap
@@ -1424,6 +2211,7 @@ class ZaloPersonalAdapter(BasePlatformAdapter):
                 is_group=is_group,
                 datamark_nonce=datamark_nonce,
                 current_chat_id=thread_id,
+                gender=_lookup_user_gender(from_uid),
             )
             if channel_prompt:
                 channel_prompt = identity_note + "\n\n" + channel_prompt
@@ -1466,7 +2254,66 @@ class ZaloPersonalAdapter(BasePlatformAdapter):
             # need quote bubbles since the conversation context is obvious.
             reply_to_message_id=message_id if is_group else None,
         )
-        await self.handle_message(msg_event)
+        # Báo "đang soạn tin…" cho khách ngay khi đã quyết định trả lời, để họ
+        # biết bot đã thấy tin và đang xử lý (Zalo tự tắt khi tin trả lời gửi
+        # đi hoặc sau vài giây). Best-effort — lỗi typing không chặn luồng.
+        try:
+            await self.send_typing(thread_id, metadata={"thread_type": thread_type})
+        except Exception as e:
+            logger.debug(f"[zalo-personal] send_typing on inbound failed: {e}")
+
+        # Gom tin text thuần gửi liên tiếp trước khi đẩy cho agent. Tin có
+        # media (ảnh/voice) hoặc khi debounce tắt → xử lý ngay như cũ.
+        is_plain_text = bool((text or "").strip()) and not media_urls
+        if self._inbound_debounce_seconds > 0 and is_plain_text:
+            await self._debounce_inbound(thread_id, msg_event, text or "")
+        else:
+            await self._flush_inbound_debounce(thread_id)  # giữ thứ tự nếu có buffer
+            await self.handle_message(msg_event)
+
+    async def _debounce_inbound(self, thread_id: str, msg_event, text: str) -> None:
+        """Buffer tin text theo thread; reset timer mỗi khi có tin mới. Hết
+        khoảng im lặng mới gom text (newline-join) rồi đẩy 1 lượt cho agent."""
+        st = self._inbound_debounce.get(thread_id)
+        if st and st.get("task") and not st["task"].done():
+            st["task"].cancel()
+        if not st:
+            st = {"event": msg_event, "texts": []}
+            self._inbound_debounce[thread_id] = st
+        # Luôn dùng event MỚI NHẤT (giữ message_id/quote mới) nhưng gộp text.
+        st["event"] = msg_event
+        st["texts"].append(text)
+        st["task"] = asyncio.ensure_future(self._debounce_timer(thread_id))
+
+    async def _debounce_timer(self, thread_id: str) -> None:
+        try:
+            await asyncio.sleep(self._inbound_debounce_seconds)
+        except asyncio.CancelledError:
+            return
+        await self._flush_inbound_debounce(thread_id)
+
+    async def _flush_inbound_debounce(self, thread_id: str) -> None:
+        """Đẩy buffer (nếu có) cho agent: gộp text các tin đã gom."""
+        st = self._inbound_debounce.pop(thread_id, None)
+        if not st:
+            return
+        # Flush thường được gọi từ chính _debounce_timer — không được cancel
+        # current task, nếu không CancelledError nuốt luôn handle_message bên dưới.
+        task = st.get("task")
+        current = asyncio.current_task()
+        if task and task is not current and not task.done():
+            task.cancel()
+        event = st["event"]
+        texts = [t for t in st["texts"] if t and t.strip()]
+        if len(texts) > 1:
+            try:
+                event.text = "\n".join(texts)
+            except Exception:
+                pass
+        try:
+            await self.handle_message(event)
+        except Exception as e:
+            logger.warning(f"[zalo-personal] flush debounce lỗi: {e}")
 
     async def _transcribe_voice(self, audio_path: str) -> Optional[str]:
         """Run Hermes STT on a local audio file. Returns transcript or None."""
@@ -1511,9 +2358,29 @@ class ZaloPersonalAdapter(BasePlatformAdapter):
                 if str(m.get("uid") or "") == self._self_uid:
                     return True
         # Fallback: zca-js sometimes renders mention as "@DisplayName" in text.
+        # Also allow plain name mentions (owner use-case: active listening but
+        # only reply when people say the bot name, e.g. "ông bụt ai").
+        text_l = (text or "").lower()
+        aliases = []
         self_name = event.get("self_name") or content.get("self_name")
-        if self_name and isinstance(self_name, str) and self_name.lower() in text.lower():
-            return True
+        if self_name and isinstance(self_name, str):
+            aliases.append(self_name)
+        try:
+            persona = _load_bot_persona()
+            chat_persona = _get_chat_persona(str(event.get("thread_id") or ""))
+            aliases.extend([
+                chat_persona.get("name", ""),
+                persona.get("name", ""),
+            ])
+        except Exception:
+            pass
+        # Tên gọi cấu hình qua ENV (ZALO_PERSONAL_NAME_TRIGGERS) — bổ sung vào
+        # alias, cho phép gọi bot bằng biệt danh ngắn ("bụt", "sếp ơi") mà
+        # persona name (thường dài) không bắt được.
+        aliases.extend(getattr(self, "name_triggers", []))
+        for alias in aliases:
+            if isinstance(alias, str) and alias.strip() and alias.strip().lower() in text_l:
+                return True
         return False
 
     # Tokens mà nếu xuất hiện trong tên hiển thị của NGƯỜI KHÔNG PHẢI CHỦ
@@ -1552,6 +2419,7 @@ class ZaloPersonalAdapter(BasePlatformAdapter):
         is_group: bool,
         datamark_nonce: Optional[str] = None,
         current_chat_id: str = "",
+        gender: str = "unknown",
     ) -> str:
         """Build a strong system instruction so the bot addresses a non-owner
         correctly instead of defaulting to the owner's nickname ("sếp")."""
@@ -1644,7 +2512,8 @@ class ZaloPersonalAdapter(BasePlatformAdapter):
             f"(chủ tài khoản).{warn_nickname} "
             f"Quy tắc xưng hô: gọi họ theo tên hiển thị (vd \"chị {user_name}\" / "
             f"\"anh {user_name}\" / \"em {user_name}\" tùy phỏng đoán giới tính-tuổi), "
-            f"em xưng \"em\" với họ và KHÔNG gọi họ là sếp.\n\n"
+            f"em xưng \"em\" với họ và KHÔNG gọi họ là sếp.{_gender_hint(gender, user_name)}"
+            f"{_PROFILE_USAGE_RULE}\n\n"
             "═══ ẨN DANH SẾP — TUYỆT ĐỐI ═══\n"
             "Khi reply cho người này, KHÔNG bao giờ gọi sếp bằng tên thật "
             "(tên đầy đủ, email, SĐT). Chỉ gọi \"sếp\". Nếu họ hỏi "
@@ -1714,6 +2583,24 @@ class ZaloPersonalAdapter(BasePlatformAdapter):
             "Nếu họ chưa rõ định dạng → HỎI LẠI 1 câu (\"Anh/chị muốn HTML, "
             "PDF, PowerPoint hay Excel ạ?\"). Rate limit 5 file/giờ/người, "
             "vượt quota tool trả lỗi → báo lại lịch sự.\n"
+            "8. ĐƯỢC đặt nhắc hẹn giúp người dùng — tool zalo_create_reminder("
+            "title, at='YYYY-MM-DD HH:MM' HOẶC in_minutes=N, repeat=none/daily/"
+            "weekly/monthly). Đây là nhắc hẹn NATIVE hiện trên bảng tin Zalo "
+            "của ĐÚNG nhóm/chat hiện tại. VD: \"5 phút nữa nhắc tôi gọi khách\" "
+            "→ zalo_create_reminder(title='Gọi khách', in_minutes=5); \"nhắc "
+            "9h mai họp\" → zalo_create_reminder(title='Họp', at='<mai> 09:00'). "
+            "TUYỆT ĐỐI KHÔNG dùng cron (tool nội bộ, chỉ sếp) — với người này "
+            "CHỈ dùng zalo_create_reminder. Chỉ đặt cho nhóm/chat hiện tại "
+            "(không đặt hộ nhóm khác). Rate limit 3 nhắc/giờ/người; vượt quota "
+            "tool trả lỗi → báo lại lịch sự.\n"
+            "9. ĐƯỢC đặt LỊCH NHẮC CÓ TAG trong NHÓM — tool zalo_schedule_reminder("
+            "task, target='TênNgười' (để tag), in_minutes=N HOẶC at='YYYY-MM-DD HH:MM'; "
+            "tùy chọn deadline + max_attempts để nhắc leo thang tới hạn). Tới giờ em TỰ "
+            "NHẮN tin trong nhóm, tag @người đó. Dùng khi có người nhờ nhắc AI ĐÓ làm gì "
+            "đúng giờ, vd \"5 phút nữa nhắc @Trân nộp bài\" → zalo_schedule_reminder("
+            "task='nộp bài', target='Trân', in_minutes=5). KHÁC mục 8 (zalo_create_reminder "
+            "chỉ hiện trên bảng tin, KHÔNG nhắn + tag). TUYỆT ĐỐI KHÔNG dùng cron. CHỈ trong "
+            "NHÓM và chỉ nhóm hiện tại. Rate limit 3 nhắc/giờ/người.\n"
             "═════════════════════════════════════════"
             + persona_block
             + datamark_block
@@ -1739,6 +2626,114 @@ class ZaloPersonalAdapter(BasePlatformAdapter):
             tmp.replace(self._last_seen_path)
         except Exception as e:
             logger.debug(f"[zalo-personal] save last_seen failed: {e}")
+
+    def _load_greeted_groups(self) -> set:
+        try:
+            if self._greeted_groups_path.exists():
+                with open(self._greeted_groups_path, encoding="utf-8") as f:
+                    data = json.load(f)
+                    if isinstance(data, list):
+                        return {str(x) for x in data}
+        except Exception as e:
+            logger.debug(f"[zalo-personal] load greeted_groups failed: {e}")
+        return set()
+
+    def _save_greeted_groups(self) -> None:
+        try:
+            self._greeted_groups_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self._greeted_groups_path.with_suffix(".tmp")
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(sorted(self._greeted_groups), f)
+            tmp.replace(self._greeted_groups_path)
+        except Exception as e:
+            logger.debug(f"[zalo-personal] save greeted_groups failed: {e}")
+
+    def _load_auto_friend_requested(self) -> set:
+        try:
+            if self._auto_friend_path.exists():
+                with open(self._auto_friend_path, encoding="utf-8") as f:
+                    data = json.load(f)
+                    if isinstance(data, list):
+                        return {str(x) for x in data}
+        except Exception as e:
+            logger.debug(f"[zalo-personal] load auto_friend_requested failed: {e}")
+        return set()
+
+    def _save_auto_friend_requested(self) -> None:
+        try:
+            self._auto_friend_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self._auto_friend_path.with_suffix(".tmp")
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(sorted(self._auto_friend_requested), f)
+            tmp.replace(self._auto_friend_path)
+        except Exception as e:
+            logger.debug(f"[zalo-personal] save auto_friend_requested failed: {e}")
+
+    async def _is_friend(self, uid: str) -> bool:
+        """uid đã nằm trong danh bạ chưa. Cache 5 phút — /friends/all là API
+        nặng, không thể gọi mỗi tin nhắn đến."""
+        now = time.time()
+        if now - self._friend_uids_ts > 300:
+            try:
+                r = await asyncio.to_thread(_mk_client().get_all_friends)
+                if r.get("ok"):
+                    self._friend_uids = {
+                        str(f.get("uid")) for f in (r.get("friends") or []) if f.get("uid")
+                    }
+                    self._friend_uids_ts = now
+            except Exception as e:
+                logger.debug(f"[zalo-personal] refresh friends failed: {e}")
+                # Không refresh được → coi như ĐÃ là bạn để KHÔNG mời nhầm.
+                return True
+        return str(uid) in self._friend_uids
+
+    async def _maybe_auto_friend_request(self, uid: str) -> None:
+        """Người lạ DM bot → tự gửi lời mời kết bạn (1 lần/uid, có hạn mức).
+
+        Dùng chung hạn mức ngày ``daily_friend_cap`` với phễu marketing để
+        tổng số lời mời/ngày không vượt ngưỡng an toàn của Zalo.
+        """
+        uid = str(uid or "").strip()
+        if not self._auto_friend_enabled or not uid:
+            return
+        if uid == self.owner_uid or uid == self._self_uid:
+            return
+        if uid in self._auto_friend_requested or uid in self._auto_friend_inflight:
+            return
+        # Giữ chỗ NGAY (trước mọi await): người lạ nhắn dồn 5 tin thì 5 task nền
+        # cùng chạy, nếu chỉ dựa vào _auto_friend_requested (chỉ được ghi sau khi
+        # tra danh bạ xong) thì cả 5 đều lọt qua → 5 lời mời trùng.
+        self._auto_friend_inflight.add(uid)
+        try:
+            if await self._is_friend(uid):
+                return
+            store = _mk_store()
+            today = _mk_today()
+            if store.remaining("friend", today) <= 0:
+                logger.info(
+                    f"[zalo-personal] hết hạn mức kết bạn hôm nay — không tự mời uid={uid}"
+                )
+                return
+            try:
+                r = await asyncio.to_thread(
+                    _mk_client().friend_request, uid, self._auto_friend_msg
+                )
+            except Exception as e:
+                logger.debug(f"[zalo-personal] tự mời kết bạn uid={uid} lỗi: {e}")
+                return
+            if r.get("ok"):
+                # Chỉ ghi nhớ khi mời THÀNH CÔNG — mời hỏng thì tin sau thử lại.
+                self._auto_friend_requested.add(uid)
+                self._save_auto_friend_requested()
+                store.incr("friend", today)
+                self._friend_uids_ts = 0.0  # buộc refresh danh bạ ở lần sau
+                logger.info(f"[zalo-personal] đã tự gửi lời mời kết bạn tới uid={uid}")
+            else:
+                logger.debug(
+                    f"[zalo-personal] tự mời kết bạn uid={uid} thất bại: {r.get('error')}"
+                )
+        finally:
+            self._auto_friend_inflight.discard(uid)
 
     def _seed_thread_types_from_sessions(self) -> None:
         """Populate ``_thread_types`` from the on-disk session directory so
@@ -1905,6 +2900,28 @@ class ZaloPersonalAdapter(BasePlatformAdapter):
         """
         if not text or not chat_id or "@" not in text:
             return []
+        mentions: List[Dict[str, Any]] = []
+        # Track which character positions are already used so we don't
+        # double-mention the same span (e.g. @Duy inside @Duy Tran).
+        consumed = [False] * len(text)
+        # ``@All`` → tag toàn nhóm. zca-js coi mention có ``uid == "-1"`` là
+        # type 1 = mention-all (sendMessage.js). Xử lý TRƯỚC danh bạ member,
+        # và không cần group-member directory.
+        _all_start = 0
+        while True:
+            _pos = text.find("@All", _all_start)
+            if _pos < 0:
+                break
+            _end = _pos + 4
+            # word boundary: "@All" không dính chữ phía sau (vd "@Allen")
+            _boundary_ok = _end >= len(text) or not (
+                text[_end].isalnum() or text[_end] == "_"
+            )
+            if _boundary_ok and not any(consumed[_pos:_end]):
+                mentions.append({"pos": _pos, "uid": "-1", "len": 4})
+                for _i in range(_pos, _end):
+                    consumed[_i] = True
+            _all_start = _end
         members = self._group_members.get(str(chat_id)) or {}
         # Also allow tagging the owner (chính sếp) by name.
         owner_name = (
@@ -1912,14 +2929,8 @@ class ZaloPersonalAdapter(BasePlatformAdapter):
         )
         if owner_name and self.owner_uid:
             members = {**members, owner_name: self.owner_uid}
-        if not members:
-            return []
         # Longest-first so "Duy Tran" beats "Duy"
         sorted_names = sorted(members.keys(), key=lambda n: -len(n))
-        mentions: List[Dict[str, Any]] = []
-        # Track which character positions are already used so we don't
-        # double-mention the same span (e.g. @Duy inside @Duy Tran).
-        consumed = [False] * len(text)
         for name in sorted_names:
             target = "@" + name
             tlen = len(target)
@@ -1946,6 +2957,274 @@ class ZaloPersonalAdapter(BasePlatformAdapter):
                 start = pos + tlen
         mentions.sort(key=lambda m: m["pos"])
         return mentions
+
+    async def _handle_group_event(self, event: Dict[str, Any]) -> None:
+        """Chào nhóm khi CHÍNH bot được thêm vào group.
+
+        Sidecar forward zca-js GroupEvent dưới dạng
+        ``{"type":"group_event","data":{type, act, data:{...}, threadId, isSelf}}``.
+        Khi ``type == "join"`` và ``isSelf`` (bot nằm trong updateMembers), bot
+        tự soạn 1 lời chào (LLM, theo tên nhóm) rồi gửi kèm tag @All.
+        """
+        if not self._group_greeting_enabled:
+            return
+        ev = event.get("data")
+        if not isinstance(ev, dict):
+            return
+        etype = str(ev.get("type") or "").lower()
+        # Bot/thành viên được thêm vào nhóm = JOIN (hoặc new_link).
+        if etype not in ("join", "new_link"):
+            return
+        inner = ev.get("data") if isinstance(ev.get("data"), dict) else {}
+        group_id = str(
+            ev.get("threadId")
+            or inner.get("groupId")
+            or inner.get("group_id")
+            or ""
+        ).strip()
+        if not group_id:
+            return
+        # Kênh zalo-personal bị TẮT qua lệnh owner → không chào.
+        if not _channel_is_active("zalo-personal"):
+            return
+        # Lấy tên nhóm bằng code có sẵn của adapter (cache + sidecar
+        # getGroupInfo), thay vì tự tin vào payload group_event.
+        try:
+            group_name = await self._resolve_group_name(group_id)
+        except Exception:
+            group_name = ""
+        self._thread_types[group_id] = "group"
+        if not ev.get("isSelf"):
+            await self._handle_group_member_join(inner, group_id, group_name)
+            return
+        # Chống gửi trùng lời chào khi CHÍNH bot được thêm vào group
+        # (reconnect / event replay). Không áp dụng cho thành viên mới.
+        if group_id in self._greeted_groups:
+            return
+        # Đánh dấu ĐÃ chào TRƯỚC khi gọi agent để tránh double nếu event lặp.
+        self._greeted_groups.add(group_id)
+        self._save_greeted_groups()
+        self._thread_types[group_id] = "group"
+        logger.info(
+            f"[zalo-personal] bot được thêm vào group '{group_name}' "
+            f"({group_id}) — soạn lời chào"
+        )
+        # LLM tự soạn lời chào theo tên nhóm. Đẩy qua pipeline agent với
+        # internal=True (bỏ qua authz + require_mention); câu trả lời của agent
+        # được gửi vào group, "@All" được resolve ở đường outbound.
+        _gn = group_name or "nhóm này"
+        _persona = _load_bot_persona()
+        _pname = (_persona.get("name") or "trợ lý").strip()
+        _pstyle = (_persona.get("personality") or "").strip()
+        prompt = (
+            "[SỰ KIỆN HỆ THỐNG — không phải tin của người dùng] "
+            f"Tên của bạn là {_pname}. PHONG CÁCH XƯNG HÔ BẮT BUỘC, áp cho CẢ lời chào này: {_pstyle} "
+            f"Bạn vừa được thêm vào một nhóm Zalo tên \"{_gn}\". "
+            "Hãy soạn ĐÚNG MỘT tin nhắn chào cả nhóm, thân thiện, ngắn gọn:\n"
+            "• Dòng đầu bắt đầu bằng \"@All\" (giữ nguyên đúng chữ này để tag mọi người), "
+            "kèm 1 emoji vẫy chào (ví dụ 👋).\n"
+            "• Giới thiệu bản thân ngắn gọn.\n"
+            f"• Suy ra chủ đề nhóm từ tên \"{_gn}\" rồi nêu 3-4 việc bạn giúp được "
+            "phù hợp chủ đề đó, MỖI việc xuống dòng riêng và bắt đầu bằng 1 emoji "
+            "hợp ngữ cảnh (ví dụ 📈 💰 📅 🏸 📊 📝 …).\n"
+            "• Ngoài ra, gợi ý thêm vài tính năng người dùng hay dùng như: tạo file office, tạo ảnh, dịch thuật, tra cứu phạt nguội, giá vàng, lịch âm,...\n"
+            "• Kết bằng lời mời mọi người trong nhóm cứ nhắc tên/tag bạn kèm câu hỏi bất cứ lúc nào; ai cần hỗ trợ riêng thì cứ nhắn bạn, vì bạn hỗ trợ 24/7.\n"
+            "YÊU CẦU TRÌNH BÀY: chèn emoji/icon hợp lý, chia thành các đoạn ngắn "
+            "cách nhau bằng dòng trống cho thoáng, TRÁNH viết một khối chữ dồn dập. "
+            "Đừng lạm dụng quá nhiều emoji (mỗi dòng tối đa 1-2 cái).\n"
+            "Chỉ xuất ra nội dung tin nhắn chào, không thêm giải thích."
+        )
+        # QUAN TRỌNG: KHÔNG dùng session ngữ cảnh chung của nhóm
+        # (_group_shared_source) cho lời chào — nếu không, prompt lệnh chào sẽ
+        # được lưu vào transcript nhóm và bị _build_group_context nạp lại ở MỌI
+        # lượt sau → bot chào đi chào lại mỗi khi có người mention. Dùng session
+        # RIÊNG chỉ để sinh lời chào 1 lần; reply vẫn về đúng group nhờ
+        # chat_id=group_id.
+        source = self.build_source(
+            chat_id=group_id,
+            chat_name=group_name or f"zalo-group:{group_id}",
+            chat_type="group",
+            user_id=f"zalo:__greeting__:{group_id}",
+            user_name="group-greeting",
+        )
+        try:
+            msg_event = MessageEvent(
+                text=prompt,
+                source=source,
+                internal=True,
+                message_id=str(int(time.time() * 1000)),
+                timestamp=datetime.datetime.now(),
+            )
+            await self.handle_message(msg_event)
+        except Exception as e:
+            logger.warning(
+                f"[zalo-personal] gửi lời chào group {group_id} lỗi: {e}"
+            )
+            # Rollback marker để thử lại lần sau nếu thất bại.
+            self._greeted_groups.discard(group_id)
+            self._save_greeted_groups()
+
+    async def _handle_group_member_join(
+        self, inner: Dict[str, Any], group_id: str, group_name: str
+    ) -> None:
+        """Gửi lời chào khi thành viên mới vào nhóm.
+
+        Template nằm trong `/opt/data/zalo/bot_persona.json` để nội dung chào
+        mừng do owner chỉnh không bị mất khi cập nhật plugin. Hỗ trợ các biến:
+        `{group_name}`, `{member_name}`, `{member_names}`.
+        """
+        persona = _load_bot_persona()
+        if persona.get("group_member_welcome_enabled") is False:
+            return
+        members = inner.get("updateMembers")
+        if not isinstance(members, list) or not members:
+            return
+        new_names: List[str] = []
+        for m in members:
+            if not isinstance(m, dict):
+                continue
+            uid = str(m.get("id") or m.get("uid") or "").strip()
+            if self._self_uid and uid == self._self_uid:
+                continue
+            name = str(m.get("dName") or m.get("name") or "").strip()
+            if uid and name:
+                self._remember_group_member(group_id, uid, name)
+            if name:
+                new_names.append(name)
+        if not new_names:
+            return
+        template = str(persona.get("group_welcome_text") or "").strip()
+        if not template:
+            # Không hardcode tên/xưng hô của một persona cụ thể: lấy tên từ
+            # bot_persona.json (owner đổi được qua zalo_set_persona), giọng
+            # trung tính. Owner muốn khác thì đặt `group_welcome_text`.
+            pname = str(persona.get("name") or "").strip() or "trợ lý ảo"
+            template = (
+                "@All 👋 Chào mừng {member_names} vào nhóm {group_name} nha!\n\n"
+                f"Mình là {pname}. Mọi người cứ tag mình kèm câu hỏi hoặc yêu "
+                "cầu cụ thể, mình xử lý cho nhanh gọn nha."
+            )
+        rendered = self._render_group_welcome_template(
+            template, group_name=group_name, member_names=new_names
+        )
+        try:
+            result = await self.send(
+                group_id,
+                rendered,
+                metadata={"thread_type": "group", "event": "group_member_join"},
+            )
+            if not result.success:
+                logger.warning(
+                    f"[zalo-personal] member welcome send failed group={group_id}: "
+                    f"{result.error}"
+                )
+        except Exception as e:
+            logger.warning(
+                f"[zalo-personal] member welcome exception group={group_id}: {e}"
+            )
+
+    @staticmethod
+    def _render_group_welcome_template(
+        template: str, group_name: str, member_names: List[str]
+    ) -> str:
+        group = (group_name or "nhóm mình").strip()
+        names = [str(n).strip() for n in (member_names or []) if str(n).strip()]
+        member_names_s = ", ".join(names) if names else "thành viên mới"
+        member_name_s = names[0] if names else "thành viên mới"
+        topic = ZaloPersonalAdapter._infer_group_topic_label(group)
+        topic_help_list = ZaloPersonalAdapter._infer_group_topic_help_list(group)
+        text = str(template or "")
+        replacements = {
+            "{group_name}": group,
+            "{{group_name}}": group,
+            "{group_topic}": topic,
+            "{{group_topic}}": topic,
+            "{topic_help_list}": topic_help_list,
+            "{{topic_help_list}}": topic_help_list,
+            "{member_names}": member_names_s,
+            "{{member_names}}": member_names_s,
+            "{member_name}": member_name_s,
+            "{{member_name}}": member_name_s,
+        }
+        for key, value in replacements.items():
+            text = text.replace(key, value)
+        # Backward compatibility for the earlier fixed test greeting.
+        text = text.replace("Chào cả nhóm test nha!", f"Chào cả nhóm {group} nha!")
+        return text.strip()
+
+    @staticmethod
+    def _infer_group_topic_label(group_name: str) -> str:
+        """Infer a short human label from the Zalo group name for greetings."""
+        name = (group_name or "").strip()
+        low = name.lower()
+        rules = (
+            (("chứng khoán", "chung khoan", "stock", "trading", "crypto", "coin"), "Chứng khoán"),
+            (("sinh viên", "sinh vien", "student", "k15", "k16", "ufm", "vku"), "Sinh viên"),
+            (("tuyển dụng", "tuyen dung", "việc làm", "viec lam", "job", "hr"), "Tuyển dụng"),
+            (("bất động sản", "bat dong san", "bđs", "bds"), "Bất động sản"),
+            (("marketing", "seo", "content"), "Marketing"),
+            (("bán hàng", "ban hang", "sales", "kinh doanh"), "Bán hàng"),
+        )
+        for keys, label in rules:
+            if any(k in low for k in keys):
+                return label
+        return name or "nhóm mình"
+
+    @staticmethod
+    def _infer_group_topic_help_list(group_name: str) -> str:
+        """Return 3-5 greeting bullets tailored to the inferred group topic."""
+        name = (group_name or "").strip()
+        low = name.lower()
+        topic_rules: Tuple[Tuple[Tuple[str, ...], Tuple[str, ...]], ...] = (
+            (("chứng khoán", "chung khoan", "stock", "trading", "crypto", "coin"), (
+                "📈 Tóm tắt tin thị trường, mã cổ phiếu và xu hướng nổi bật",
+                "💰 Gợi ý checklist quản trị rủi ro, vốn và kỷ luật giao dịch",
+                "🧾 Soạn kịch bản nhận định, bản tin, recap phiên cho nhóm",
+                "📊 Lập bảng theo dõi danh mục, watchlist, kế hoạch mua/bán",
+            )),
+            (("sinh viên", "sinh vien", "student", "k15", "k16", "ufm", "vku"), (
+                "🎓 Tóm tắt bài học, tài liệu, đề cương ôn tập",
+                "📝 Soạn bài thuyết trình, báo cáo, CV và email xin thực tập",
+                "📚 Lên kế hoạch học tập, lịch deadline, checklist bài nhóm",
+                "💡 Gợi ý ý tưởng nghiên cứu, dự án, hoạt động CLB",
+            )),
+            (("tuyển dụng", "tuyen dung", "việc làm", "viec lam", "job", "hr"), (
+                "📌 Soạn JD, bài đăng tuyển và tin nhắn mời ứng viên",
+                "🧑‍💼 Lọc CV theo tiêu chí, tạo checklist phỏng vấn",
+                "💬 Viết kịch bản phỏng vấn, email hẹn lịch, thư offer/từ chối",
+                "📊 Tổng hợp pipeline ứng viên, báo cáo tuyển dụng nhanh",
+            )),
+            (("bất động sản", "bat dong san", "bđs", "bds"), (
+                "🏡 Soạn mô tả tin đăng nhà đất, kịch bản tư vấn khách",
+                "📍 Tóm tắt tiện ích khu vực, điểm mạnh dự án/sản phẩm",
+                "📞 Viết tin nhắn chăm sóc lead, follow-up khách quan tâm",
+                "📊 Lập bảng so sánh giá, diện tích, pháp lý, ưu nhược điểm",
+            )),
+            (("marketing", "seo", "content"), (
+                "📣 Lên ý tưởng campaign, angle nội dung và lịch đăng bài",
+                "✍️ Soạn caption, bài PR, kịch bản video ngắn",
+                "🔍 Gợi ý từ khoá SEO, tiêu đề, mô tả và outline bài viết",
+                "📊 Tổng hợp insight, checklist tối ưu nội dung/quảng cáo",
+            )),
+            (("bán hàng", "ban hang", "sales", "kinh doanh"), (
+                "🛒 Soạn kịch bản tư vấn, chốt đơn và xử lý từ chối",
+                "📦 Viết mô tả sản phẩm, bảng giá, chương trình ưu đãi",
+                "💬 Tạo tin nhắn chăm sóc khách cũ, follow-up lead",
+                "📊 Tổng hợp đơn hàng, nhu cầu khách và báo cáo bán hàng",
+            )),
+        )
+        for keys, bullets in topic_rules:
+            if any(k in low for k in keys):
+                return "\n".join(bullets)
+        # Generic fallback still related to the named group, without replacing
+        # the separate common capability list that follows in the template.
+        group_label = name or "nhóm mình"
+        return "\n".join((
+            f"🧭 Tóm tắt và hệ thống hoá nội dung thảo luận trong {group_label}",
+            "📝 Soạn thông báo, kế hoạch, checklist việc cần làm cho nhóm",
+            "💡 Gợi ý ý tưởng, kịch bản trả lời và phương án triển khai nhanh",
+            "📊 Tổng hợp thông tin, lập bảng theo dõi và báo cáo ngắn gọn",
+        ))
 
     def _remember_quote_payload(self, message_id: str, event: Dict[str, Any]) -> None:
         """Stash the Zalo quote-payload for a received message, keyed by
@@ -2261,9 +3540,48 @@ class ZaloPersonalAdapter(BasePlatformAdapter):
     # occasionally fails the send entirely. We keep each outgoing chunk
     # under this threshold; longer responses are split.
     SEND_CHUNK_LIMIT = 1900
-    SEND_CHUNK_HARD_LIMIT = 4500  # split if response exceeds this
 
     async def send(
+        self,
+        chat_id: str,
+        content: str,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Outbound entry. Deliver hitechcloud-hosted QR/invoice image links as
+        native Zalo photos, then send the remaining text unchanged. The MCP
+        hitechcloud payment tools return an image *link* in text (not an MCP
+        ImageContent block), so without this the bot just pastes the URL."""
+        qr_images = _extract_hitechcloud_media_images(content) if content else []
+        if qr_images:
+            content = _strip_media_urls(content, qr_images)
+        text_result: Optional[SendResult] = None
+        if content and content.strip():
+            text_result = await self._send_text_impl(
+                chat_id, content, reply_to=reply_to, metadata=metadata
+            )
+        img_result: Optional[SendResult] = None
+        for _url in qr_images:
+            try:
+                img_result = await self.send_image(
+                    chat_id, _url, metadata=metadata
+                )
+                if not img_result.success:
+                    logger.warning(
+                        f"[zalo-personal] hitechcloud QR image send failed "
+                        f"({img_result.error}) url={_url}"
+                    )
+            except Exception as e:
+                logger.warning(
+                    f"[zalo-personal] hitechcloud QR image send exception: {e} url={_url}"
+                )
+        if text_result is not None:
+            return text_result
+        if img_result is not None:
+            return img_result
+        return SendResult(success=False, error="empty content")
+
+    async def _send_text_impl(
         self,
         chat_id: str,
         content: str,
@@ -2274,6 +3592,17 @@ class ZaloPersonalAdapter(BasePlatformAdapter):
         if not content or not content.strip():
             return SendResult(success=False, error="empty content")
 
+        # Cron/reminder jobs fire with a technical envelope (Cronjob Response /
+        # job_id / dashed separator / "To stop or manage this job" footer).
+        # Strip it FIRST so only the natural-language body reaches Zalo — this
+        # runs for the owner DM too (the cron home channel), which the scrub
+        # filters below deliberately skip.
+        content = _strip_cron_envelope(content)
+        content = _zalo_plaintext(content)
+        content = _EKYC_OLD_RE.sub(_EKYC_NEW_BASE, content)
+        if not content.strip():
+            return SendResult(success=False, error="empty content")
+
         # Phản hồi thật đã tới → huỷ hẹn-giờ báo-chậm (nếu có) cho chat này.
         _cid = str(chat_id)
         _ack = self._slow_ack_tasks.pop(_cid, None)
@@ -2281,23 +3610,68 @@ class ZaloPersonalAdapter(BasePlatformAdapter):
             _ack.cancel()
         self._slow_ack_fired.discard(_cid)
 
-        # The owner's DM is the operator's debug feed — pass status messages
-        # through untouched so they can audit the bot. Everywhere else
-        # (groups, non-owner DMs) gets BOTH the scrubbed-status filter AND
-        # the leak-scrub filter that strips IPs, OS info, paths, etc.
+        # ── Universal operational/terminal filter (ALL chats, incl. owner DM) ──
+        # Lifecycle/progress diagnostics (busy/interrupt, compaction) NEVER reach
+        # any chat; terminal failures collapse to ONE localized recovery notice
+        # per chat/category; a real answer next to a notice is preserved. Owner
+        # audit continues via structured logs, not chat spam.
+        # Non-owner chats additionally lose the operator-facing notices core
+        # keeps visible on purpose (/compress feedback, compression aborted,
+        # blocked-overflow warning) — see message_filtering._OWNER_ONLY_*.
+        _decision = _classify_outbound(content, is_owner=self._is_owner_dm(chat_id))
+        if _decision.action == _FilterAction.DROP_OPERATIONAL:
+            logger.info("[zalo-personal] dropped operational msg cats=%s chat_hash=%s",
+                        ",".join(_decision.categories), _chat_hash(chat_id))
+            return SendResult(success=True, raw_response={"dropped": "operational"})
+        if _decision.action == _FilterAction.REPLACE_TERMINAL:
+            _rk = "%s:%s:%s:%s" % (
+                self._self_uid or "?", _cid,
+                (metadata or {}).get("task_id") or (metadata or {}).get("correlation_id") or "",
+                _decision.recovery_key or "terminal",
+            )
+            if not _RECOVERY_LIMITER.should_emit(_rk, time.monotonic()):
+                logger.info("[zalo-personal] suppressed repeat terminal notice cat=%s chat_hash=%s",
+                            _decision.recovery_key, _chat_hash(chat_id))
+                return SendResult(success=True, raw_response={"dropped": "terminal_repeat"})
+            logger.warning("[zalo-personal] terminal failure → recovery notice cat=%s chat_hash=%s",
+                           _decision.recovery_key, _chat_hash(chat_id))
+            content = _persona_notice("recovery", _decision.cleaned_text)
+        else:
+            content = _decision.cleaned_text
+        if not content.strip():
+            return SendResult(success=True, raw_response={"dropped": "empty_after_filter"})
+
+        # Everywhere except owner DM additionally gets brand/leak redaction
+        # (IPs, OS info, paths, vendor names). Owner DM keeps real names for
+        # auditing but — unlike before — no longer bypasses the operational
+        # filter above.
         if not self._is_owner_dm(chat_id):
+            content = _strip_non_owner_internal_noise(content)
+            if not content.strip():
+                logger.debug(
+                    f"[zalo-personal] internal owner-only notice dropped (chat={chat_id})"
+                )
+                return SendResult(success=True, raw_response={"dropped": "owner_only_internal_notice"})
             scrubbed = _scrub_outgoing(content)
             if scrubbed is None:
+                # Nội dung bị coi là nhiễu/nội bộ với khách thường. Trước đây
+                # gửi câu trấn an (_USER_SOFT_ERROR_NOTICE); nay TẮT theo yêu cầu
+                # → im lặng (drop) thay vì gửi "Anh/chị chờ em chút…".
                 logger.debug(
-                    f"[zalo-personal] suppressed noisy status (chat={chat_id})"
+                    f"[zalo-personal] noisy status -> dropped (soft notice disabled) "
+                    f"(chat={chat_id})"
                 )
-                return SendResult(success=True, message_id="suppressed")
-            content = _scrub_leak(scrubbed)
+                return SendResult(
+                    success=True,
+                    raw_response={"dropped": "soft_error_notice_disabled"},
+                )
+            else:
+                content = _scrub_leak(scrubbed)
 
         # If the message is too long, split into chunks and send sequentially.
         # Only the FIRST chunk attaches the quote (reply_to); subsequent
         # chunks are plain follow-ups so the conversation stays clean.
-        if len(content) > self.SEND_CHUNK_HARD_LIMIT:
+        if len(content) > self.SEND_CHUNK_LIMIT:
             chunks = self._split_long_message(content, self.SEND_CHUNK_LIMIT)
             first_result: Optional[SendResult] = None
             for idx, chunk in enumerate(chunks):
@@ -2504,7 +3878,8 @@ class ZaloPersonalAdapter(BasePlatformAdapter):
             f"[Bối cảnh] Người đang chat với em {scope} là SẾP (chủ tài "
             f"khoản). Em xưng \"em\", gọi sếp \"sếp\". "
             f"TUYỆT ĐỐI KHÔNG gọi sếp bằng tên thật trong reply, kể cả trong "
-            f"DM riêng — vì tin nhắn có thể bị forward/screenshot.{chat_id_hint}\n\n"
+            f"DM riêng — vì tin nhắn có thể bị forward/screenshot.{chat_id_hint}"
+            f"{_PROFILE_USAGE_RULE}\n\n"
             "═══ SẾP RA LỆNH — em phải ACT, không chỉ acknowledge ═══\n"
             "Sếp có quyền điều chỉnh em runtime qua các tool dưới đây. "
             "Khi sếp nói gì đó match với 1 trong các pattern này, em PHẢI gọi "
@@ -2615,6 +3990,36 @@ class ZaloPersonalAdapter(BasePlatformAdapter):
             "tên thật trong group (case-sensitive, có dấu Việt) — sai 1 ký "
             "tự là chỉ ra plain text. Nếu không chắc tên, KHÔNG bịa, hỏi "
             "lại sếp hoặc bỏ qua mention.\n\n"
+            "9. Poll / Ghi chú / Nhắc hẹn / Bảng tin nhóm:\n"
+            "   • \"tạo poll/bình chọn ...\" → zalo_create_poll(question, "
+            "options=[...], multi_choice?, anonymous?, expires_hours?)\n"
+            "   • \"ghi chú lại ...\", \"tạo note nhóm\" → zalo_create_note("
+            "title, pin?)\n"
+            "   • Nhắc hẹn / lịch nhắc / reminder — PHÂN BIỆT 2 LOẠI:\n"
+            "     ▸ MẶC ĐỊNH (\"nhắc tao 9h họp\", \"đặt lịch nhắc uống "
+            "thuốc 8h tối\", \"tạo reminder mai gọi khách\") → dùng cron "
+            "của Hermes (cron tool), KHÔNG dùng zalo_create_reminder. "
+            "Cron sẽ tự bắn tin nhắc về home channel khi tới giờ.\n"
+            "     ▸ CHỈ khi sếp NÓI RÕ \"zalo\" (vd \"tạo nhắc hẹn TRÊN "
+            "ZALO\", \"đặt reminder Zalo cho nhóm\", \"tạo lịch hẹn Zalo\") "
+            "→ zalo_create_reminder(title, at='YYYY-MM-DD HH:MM' hoặc "
+            "in_minutes=N, repeat=daily/weekly/monthly?). Đây là nhắc hẹn "
+            "NATIVE hiện trên bảng tin Zalo.\n"
+            "     ▸ Không chắc loại nào → mặc định cron Hermes, đừng tạo "
+            "reminder Zalo nếu sếp không nhắc tới Zalo.\n"
+            "   • Xem/sửa bảng tin: zalo_board_action(action=list → liệt kê "
+            "note/poll/reminder kèm id; poll_detail/poll_lock/poll_vote; "
+            "note_edit; reminder_remove)\n\n"
+            "10. Kết bạn & năng lực Zalo mở rộng:\n"
+            "   • \"chấp nhận kết bạn người này\" → zalo_friend_accept(uid)\n"
+            "   • \"đọc hình vừa gửi/hình trên nói gì\" → "
+            "zalo_read_recent_image() lấy path → vision_analyze để đọc. "
+            "(Ảnh người dùng REPLY kèm quote cũng tự đính vào tin — nhìn "
+            "media trước khi gọi tool.)\n"
+            "   • Nhu cầu khác chưa có tool riêng (forward tin, gửi voice, "
+            "gửi danh thiếp, tạo nhóm, thêm/xoá thành viên, đổi tên nhóm, "
+            "block user, tra user...) → zalo_api_call(method, args) gọi "
+            "thẳng zca-js. ThreadType: 0=User, 1=Group.\n\n"
             "QUAN TRỌNG:\n"
             "• KHÔNG chỉ ghi nhận \"dạ em nhớ rồi\" — phải gọi tool. Memory "
             "không override identity_note, chỉ tool persist mới đổi behavior thật.\n"
@@ -2623,6 +4028,65 @@ class ZaloPersonalAdapter(BasePlatformAdapter):
             "• Nếu chưa rõ ý sếp, hỏi lại 1 câu ngắn trước khi gọi tool.\n"
             "═════════════════════════════════════════════"
         )
+
+    async def _handle_call_event(
+        self,
+        content: Dict[str, Any],
+        thread_id: str,
+        from_uid: str,
+        is_group: bool,
+        chat_mode: str = "default",
+    ) -> None:
+        """Cuộc gọi tới bot → tự nhắn lại một câu (bot không nghe gọi được).
+
+        Chỉ trả lời cuộc gọi NHỠ (``action`` chứa "miss"); cuộc gọi đã kết nối
+        chỉ ghi log. Rate-limit theo chat vì khách hay bấm gọi liên tiếp mấy
+        lần. Log in ra ``action`` thô của MỌI cuộc gọi để còn chỉnh bộ nhận
+        diện nếu Zalo đổi chuỗi.
+        """
+        action = str(content.get("action") or "")
+        missed = bool(content.get("missed"))
+        logger.info(
+            "[zalo-personal] call event action=%s missed=%s video=%s "
+            "chat=%s from=%s",
+            action, missed, bool(content.get("video")), thread_id, from_uid,
+        )
+        if not missed or not self._missed_call_reply:
+            return
+        if chat_mode in ("listen_only", "mute"):
+            return
+        if is_group and not self._missed_call_in_groups:
+            return
+
+        now = time.time()
+        # Bảo trì thắng: khách gọi lúc bot đang tạm nghỉ thì cần biết là bảo
+        # trì, không phải "nhắn tin đi sẽ trả lời ngay".
+        if from_uid != self.owner_uid and _get_maintenance().get("enabled"):
+            if now - self._maint_notified.get(thread_id, 0.0) <= _MAINT_NOTICE_INTERVAL_S:
+                return
+            self._maint_notified[thread_id] = now
+            msg = _maintenance_message()
+        else:
+            if (
+                now - self._missed_call_notified.get(thread_id, 0.0)
+                <= self._missed_call_interval_s
+            ):
+                logger.debug(
+                    f"[zalo-personal] missed-call reply suppressed (RL) chat={thread_id}"
+                )
+                return
+            if len(self._missed_call_notified) > 500:  # bounded: dọn chat hết RL
+                self._missed_call_notified = {
+                    k: v for k, v in self._missed_call_notified.items()
+                    if now - v <= self._missed_call_interval_s
+                }
+            self._missed_call_notified[thread_id] = now
+            msg = _missed_call_message()
+
+        try:
+            await self.send(thread_id, msg)
+        except Exception as e:
+            logger.warning(f"[zalo-personal] missed-call reply failed: {e}")
 
     def _handle_owner_command(self, text: str, chat_id: str, is_group: bool) -> Optional[str]:
         """Parse `/bot ...` directives sent by the owner.
@@ -2695,6 +4159,47 @@ class ZaloPersonalAdapter(BasePlatformAdapter):
                 "• default      — dùng config global"
             )
 
+        if verb in ("baotri", "bao-tri", "bao_tri", "maintenance", "maint"):
+            a = arg.strip()
+            low = a.lower()
+            if low in ("off", "tắt", "tat", "stop", "0", "false"):
+                if not _set_maintenance(False):
+                    return "⚠️ Không ghi được file trạng thái bảo trì — kiểm tra quyền ghi session dir."
+                self._maint_notified.clear()
+                return "✅ Đã TẮT mode bảo trì. Bot hoạt động lại bình thường."
+            if not a:
+                cur = _get_maintenance()
+                if cur.get("enabled"):
+                    return (
+                        "🔧 Mode bảo trì: ĐANG BẬT.\n"
+                        f"Câu gửi khách: {_maintenance_message()}\n\n"
+                        "Tắt: /bot baotri off"
+                    )
+                return (
+                    "🔧 Mode bảo trì: ĐANG TẮT.\n"
+                    "Bật kèm giờ: /bot baotri Bọn em bảo trì tới 15h30 hôm nay ạ\n"
+                    "Bật mặc định: /bot baotri on"
+                )
+            if low in ("on", "bật", "bat", "1", "true"):
+                if not _set_maintenance(True, ""):
+                    return "⚠️ Không ghi được file trạng thái bảo trì — kiểm tra quyền ghi session dir."
+                self._maint_notified.clear()
+                return (
+                    "✅ Đã BẬT mode bảo trì (câu mặc định).\n"
+                    f"Câu gửi khách: {_maintenance_message()}\n\nTắt: /bot baotri off"
+                )
+            if not _maint_message_deliverable(a):
+                return (
+                    "⚠️ Câu này sẽ bị bộ lọc chặn nên khách KHÔNG nhận được "
+                    "(thường do mở đầu bằng emoji trạng thái ⚠️/🔧/⏳ hoặc nghe "
+                    "giống thông báo hệ thống). Anh viết lại bằng câu thường, "
+                    "mở đầu bằng chữ giúp em nhé. Mode bảo trì CHƯA được bật."
+                )
+            if not _set_maintenance(True, a):
+                return "⚠️ Không ghi được file trạng thái bảo trì — kiểm tra quyền ghi session dir."
+            self._maint_notified.clear()
+            return f"✅ Đã BẬT mode bảo trì.\nCâu gửi khách:\n{a}\n\nTắt: /bot baotri off"
+
         return f"Lệnh '{verb}' không hiểu. Gõ /bot help để xem cú pháp."
 
     def _owner_command_help(self) -> str:
@@ -2704,6 +4209,9 @@ class ZaloPersonalAdapter(BasePlatformAdapter):
             "/bot mode <type>         — đổi mode (active/mention_only/listen_only/mute/default)\n"
             "/bot modes               — liệt kê các mode\n"
             "/bot digest <on|off>     — bật/tắt daily digest cho chat này\n"
+            "/bot baotri              — xem trạng thái bảo trì\n"
+            "/bot baotri <câu+giờ>    — BẬT bảo trì (khách nhận thông báo tự động)\n"
+            "/bot baotri off          — TẮT bảo trì\n"
             "/bot help                — hiện trợ giúp\n\n"
             "Ví dụ:\n"
             "/bot mode active         — em phản hồi mọi tin trong chat này\n"
@@ -2838,18 +4346,18 @@ class ZaloPersonalAdapter(BasePlatformAdapter):
         it matches a known-noisy pattern (retry attempts, provider warnings,
         sethome prompts, brand leaks, self-improvement reviews).
 
-        Owner DM is exempt — the operator wants to see everything for
-        auditing. Groups and non-owner DMs get the cleaned feed.
+        Lifecycle/progress status is dropped for EVERY chat (owner DM included —
+        owner audit is via structured logs, not chat bubbles). Anything that
+        survives is routed through ``send`` → ``_send_text_impl``, the single
+        final text choke point that re-applies the same classifier.
         """
-        if self._is_owner_dm(chat_id):
-            return await self.send(chat_id, content, metadata=metadata)
-        scrubbed = _scrub_outgoing(content)
-        if scrubbed is None:
-            logger.debug(
-                f"[zalo-personal] suppressed status key={status_key} chat={chat_id}"
-            )
+        decision = _classify_outbound(content, is_owner=self._is_owner_dm(chat_id))
+        if decision.action != _FilterAction.KEEP or not decision.cleaned_text.strip():
+            logger.debug("[zalo-personal] suppressed status key=%s chat_hash=%s cats=%s",
+                         status_key, _chat_hash(chat_id), ",".join(decision.categories))
             return SendResult(success=True, message_id=f"status:{status_key}:suppressed")
-        return await self.send(chat_id, scrubbed, metadata=metadata)
+        # Route through the choke point (never POST /send/text directly here).
+        return await self.send(chat_id, decision.cleaned_text, metadata=metadata)
 
     async def send_reaction(
         self,
@@ -2911,23 +4419,25 @@ class ZaloPersonalAdapter(BasePlatformAdapter):
             return False
 
     async def _slow_ack_after(self, chat_id: str, delay: float = 8.0) -> None:
-        """Nhóm Cộng đồng Zalo KHÔNG hiện 'đang soạn'. Nếu sau `delay`s vẫn
-        chưa gửi phản hồi → gửi 1 tin báo ngắn để mọi người biết bot đang làm.
-        send() sẽ cancel task này khi phản hồi thật tới kịp (câu nhanh → im)."""
+        """P0: community slow-ACK TEXT bubble removed.
+
+        Previously this posted a fixed "đang xử lý…" text directly to
+        ``/send/text``, bypassing the outbound classifier and racing the final
+        answer (an ACK could land AFTER the real reply). We keep only a
+        best-effort typing indicator; no direct text send here.
+        """
         cid = str(chat_id)
         try:
             await asyncio.sleep(delay)
-            body = {"thread_id": cid,
-                    "thread_type": self._thread_types.get(cid, "group"),
-                    "text": "Em nhận rồi, đang xử lý ạ… chờ em chút xíu ⏳"}
+            body = {"thread_id": cid, "thread_type": self._thread_types.get(cid, "group")}
             await asyncio.get_event_loop().run_in_executor(
-                None, self._http_post_json, "/send/text", body)
+                None, self._http_post_json, "/typing", body)
             self._slow_ack_fired.add(cid)
-            logger.info(f"[zalo-personal] slow-ack sent to community chat={cid}")
+            logger.debug("[zalo-personal] slow-ack typing hint chat_hash=%s", _chat_hash(cid))
         except asyncio.CancelledError:
             pass
         except Exception as e:
-            logger.debug(f"[zalo-personal] slow-ack failed: {e}")
+            logger.debug(f"[zalo-personal] slow-ack typing failed: {e}")
         finally:
             self._slow_ack_tasks.pop(cid, None)
 
@@ -3073,6 +4583,15 @@ _NON_OWNER_BLOCKED_TOOLS: set = {
     # zalo_list_products is read-only; safe but still owner-only to avoid
     # leaking the product list to random group members.
     "zalo_list_products",
+    # zca-js passthrough tools — owner-only. Poll/note thay đổi nội dung
+    # nhóm; friend_accept đổi danh bạ; api_call là power tool gọi được MỌI
+    # method zca-js (nguy hiểm nếu non-owner điều khiển).
+    # NB: zalo_create_reminder CỐ TÌNH KHÔNG nằm đây — đã mở cho non-owner
+    # (xem _NON_OWNER_ALLOWED_TOOLS): nhắc hẹn native bó cứng vào chat hiện
+    # tại, cross-chat bị chặn + rate-limit ở cổng, không đụng file/shell.
+    # Vẫn KHÁC cron Hermes (power tool, giữ owner-only).
+    "zalo_create_poll", "zalo_create_note",
+    "zalo_board_action", "zalo_friend_accept", "zalo_api_call",
 }
 
 # Tools explicitly allowed for non-owner — these are safe-by-design.
@@ -3084,7 +4603,48 @@ _NON_OWNER_ALLOWED_TOOLS: set = {
     "translate", "sympy", "calculator",
     "zalo_group_summary",
     "zalo_send_html", "zalo_send_pptx", "zalo_send_pdf", "zalo_send_xlsx",
+    "zalo_send_image", "zalo_send_file",
     "zalo_escalate_to_owner",
+    # Nhắc hẹn NATIVE Zalo cho non-owner (nhân viên/khách tự đặt lịch nhắc).
+    # An toàn: chỉ tạo reminder trên bảng tin của ĐÚNG chat hiện tại — cổng
+    # non-owner chặn cross-chat + rate-limit chống spam (xem nhánh xử lý
+    # riêng bên dưới). KHÁC cron Hermes (power tool, vẫn owner-only).
+    "zalo_create_reminder",
+    # Nhắc ĐỘNG kiểu Osin cho non-owner: đặt lịch → tới giờ bot bắn TIN CHAT
+    # trong nhóm, tag @người, nội dung soạn bằng LLM TOOLLESS lúc nổ (không
+    # agent, không chạm tool nào → zero tool exposure, không amplification).
+    # Guards ở cổng: group-only + current-chat + rate-limit. KHÁC cron Hermes.
+    "zalo_schedule_reminder",
+    # Đọc ảnh gần nhất: an toàn — handler ÉP scope vào chat hiện tại của
+    # task (không peek chat khác), chỉ trả path ảnh đã cache của chính chat đó.
+    "zalo_read_recent_image",
+    # Upload ảnh Zalo gần nhất vào landing DEMO của đúng chat hiện tại,
+    # server-to-server (KHÔNG đưa base64 qua LLM). Thay cho zalo_recent_image_base64.
+    "zalo_upload_recent_image_to_landing",
+    # hitechcloud MCP office/* — tao tai lieu (auth=False, render thuan, KHONG dung
+    # HostBill billing/account). Cho non-owner de khach tu tao hop dong/bao gia.
+    "mcp_hitechcloud_tao_hop_dong", "mcp_hitechcloud_tao_docx", "mcp_hitechcloud_tao_pdf",
+    "mcp_hitechcloud_tao_bao_gia", "mcp_hitechcloud_tao_excel", "mcp_hitechcloud_tao_pptx",
+    "mcp_hitechcloud_tao_van_ban", "mcp_hitechcloud_ve_anh",
+    # Phong khi tool name o dang co dau cham -> base_name rut gon con "tao_*".
+    "tao_hop_dong", "tao_docx", "tao_pdf", "tao_bao_gia",
+    "tao_excel", "tao_pptx", "tao_van_ban", "ve_anh",
+    # RAG knowledge base — read-only, tra tài liệu công khai owner nạp (an toàn khách).
+    "mcp_rag_rag_search", "rag_search",
+    # Skill catalog READ-ONLY — owner chủ động mở cho non-owner: khách/nhân
+    # viên tự xem bot có kỹ năng gì và dùng thế nào. Chỉ ĐỌC (liệt kê + xem
+    # nội dung skill), KHÔNG chạy skill, không đụng file/shell/config.
+    # Đánh đổi owner đã chấp nhận: lộ danh sách + hướng dẫn skill nội bộ cho
+    # người ngoài. Mọi tool skill_* GHI (tạo/sửa/xoá) vẫn default-deny.
+    # "skills_list" là biến thể số nhiều của cùng một tool liệt kê skill —
+    # Hermes/MCP đặt tên không thống nhất, mở cả hai cho chắc.
+    "skill_view", "skill_list", "skills_list", "skill_get", "skill_search",
+    # Tool catalog READ-ONLY — cùng nhóm với skill_view/skill_list: chỉ TRA
+    # danh mục tool (tìm + xem mô tả/schema), KHÔNG gọi tool nào. Việc chạy
+    # tool tìm được vẫn phải qua đúng cổng này, nên tra cứu không tự nó nới
+    # quyền. Đánh đổi owner đã chấp nhận: khách thấy được tên/mô tả các tool
+    # nội bộ (kể cả tool owner-only) — chỉ metadata, không có dữ liệu.
+    "tool_search", "tool_describe",
 }
 
 # Rate limit cho các tool gửi file (chống spam).
@@ -3178,6 +4738,48 @@ def _bump_file_send_quota(chat_id: str, user_id: str) -> None:
     _save_file_send_state(state)
 
 
+# ── Quota theo giờ dùng chung (chống spam) ─────────────────────────────────
+# Tách sang module rate_limit.py (dep-free) để test độc lập không cần import cả
+# gateway; tái dùng cho nhắc hẹn non-owner mà KHÔNG đụng đường gửi file (8
+# call-site) đã chạy ổn định. Cùng chiến lược load kép như marketing/…: package
+# trước, fallback file khi chạy lẻ.
+try:
+    from . import rate_limit as _ratelimit  # type: ignore
+except Exception:  # pragma: no cover
+    import importlib.util as _ilu_rl
+    _rlp = os.path.join(os.path.dirname(os.path.abspath(__file__)), "rate_limit.py")
+    _spec_rl = _ilu_rl.spec_from_file_location("zalo_rate_limit", _rlp)
+    _ratelimit = _ilu_rl.module_from_spec(_spec_rl)
+    _spec_rl.loader.exec_module(_ratelimit)
+_hourly_quota_check = _ratelimit.check
+_hourly_quota_bump = _ratelimit.bump
+
+
+# Non-owner đặt nhắc hẹn native: giới hạn chống spam (reminder ping cả nhóm).
+_REMINDER_PER_CHAT_HOUR = 6
+_REMINDER_PER_USER_HOUR = 3
+_REMINDER_STATE_FILENAME = "reminder_create_state.json"
+
+
+def _reminder_state_path() -> Path:
+    return Path(
+        os.getenv("ZALO_PERSONAL_SESSION_DIR") or "/opt/data/zalo"
+    ) / _REMINDER_STATE_FILENAME
+
+
+# Nhắc ĐỘNG (zalo_schedule_reminder): quota riêng, KHÔNG dùng chung với native
+# reminder ở trên (2 tính năng khác nhau). Ping cả nhóm → siết tương tự.
+_SCHEDULE_REMINDER_PER_CHAT_HOUR = 6
+_SCHEDULE_REMINDER_PER_USER_HOUR = 3
+_SCHEDULE_REMINDER_QUOTA_FILENAME = "reminder_schedule_quota.json"
+
+
+def _schedule_reminder_quota_path() -> Path:
+    return Path(
+        os.getenv("ZALO_PERSONAL_SESSION_DIR") or "/opt/data/zalo"
+    ) / _SCHEDULE_REMINDER_QUOTA_FILENAME
+
+
 def _maybe_install_file_packages() -> Dict[str, bool]:
     """Best-effort install of python-pptx / openpyxl / weasyprint / pypdf
     at plugin load. Container rebuilds wipe site-packages,
@@ -3211,10 +4813,11 @@ def _maybe_install_file_packages() -> Dict[str, bool]:
     if not needed:
         return status
     import subprocess
+    import sys
     try:
         logger.info(f"[zalo-personal] auto-installing file-gen libs: {needed}")
         res = subprocess.run(
-            ["uv", "pip", "install", "--python", "/opt/hermes/.venv/bin/python3"] + needed,
+            ["uv", "pip", "install", "--python", sys.executable] + needed,
             check=True,
             timeout=240,
             capture_output=True,
@@ -3333,6 +4936,8 @@ def _resolve_session_user_id(session_id: str) -> Optional[str]:
     except Exception:
         return None
     for key, sess in sjson.items():
+        if not isinstance(sess, dict):
+            continue  # bo qua entry sentinel khong phai session (vd key "_README")
         if sess.get("session_id") == session_id:
             origin = sess.get("origin") or {}
             return str(origin.get("user_id") or "")
@@ -3369,12 +4974,26 @@ def _zalo_pre_tool_call_hook(
     _base = _tname.split(".")[-1] if "." in _tname else _tname
     _is_zalo_tool = _base.startswith("zalo_")
 
+    # Tool GỬI ra cho khách (ảnh/file) an toàn — cho phép LUÔN, kể cả khi
+    # session chưa resolve được. Gửi QR/ảnh/tài liệu cho khách không phải
+    # hành động nhạy cảm cần owner; chặn chúng làm hỏng UX (bot không gửi
+    # được ảnh QR/hoá đơn cho khách).
+    _SAFE_SEND = {
+        "zalo_send_image", "zalo_send_pdf", "zalo_send_xlsx",
+        "zalo_send_html", "zalo_send_pptx", "zalo_send_sticker",
+        "zalo_send_file",
+    }
+    if _base in _SAFE_SEND:
+        return None
+
     sess_record = None
     if session_id:
         try:
             with open(_hermes_home() / "sessions" / "sessions.json", encoding="utf-8") as f:
                 sjson = json.load(f)
             for sess in sjson.values():
+                if not isinstance(sess, dict):
+                    continue  # bỏ qua entry sentinel không phải session (vd key "_README")
                 if sess.get("session_id") == session_id:
                     sess_record = sess
                     break
@@ -3393,7 +5012,10 @@ def _zalo_pre_tool_call_hook(
             )
             return {
                 "action": "block",
-                "message": "Chuc nang nay chi thuc hien cho chu tai khoan (sep) thoi a.",
+                "message": _persona_notice(
+                    "deny_non_owner",
+                    "Chuc nang nay chi thuc hien cho chu tai khoan (sep) thoi a.",
+                ),
             }
         return None
     origin = sess_record.get("origin") or {}
@@ -3420,6 +5042,18 @@ def _zalo_pre_tool_call_hook(
             "IP / OS / source code / config / env / paths / tools nội bộ."
         ),
     }
+
+    # ── OPEN_ALL_hitechcloud_MCP — chủ tài khoản chủ động MỞ mọi tool mcp.hitechcloud.vn cho
+    # khách (non-owner). Owner xác nhận chấp nhận rủi ro; các thao tác nhạy cảm
+    # (billing/DNS/VPS/account) VẪN được MCP hitechcloud tự bảo vệ bằng phiên đăng nhập
+    # OTP riêng (tool auth=True cần conv_token/session) — cổng plugin mở không
+    # bỏ qua lớp OTP đó. shell/filesystem/git/zalo_api_call (không phải tool
+    # hitechcloud) VẪN khoá cho khách.
+    # Chấp nhận cả hai kiểu đặt tên: "mcp_hitechcloud_<tool>" (Hermes rút gọn) và
+    # "mcp__hitechcloud__<tool>" (chuẩn MCP mcp__<server>__<tool>) — cùng một MCP.
+    _hitechcloud_MCP_PREFIXES = ("mcp_hitechcloud_", "mcp__hitechcloud__")
+    if tname.startswith(_hitechcloud_MCP_PREFIXES) or base_name.startswith(_hitechcloud_MCP_PREFIXES):
+        return None
 
     if base_name in _NON_OWNER_ALLOWED_TOOLS:
         # zalo_group_summary được phép, NHƯNG non-owner chỉ được tóm tắt đúng
@@ -3449,6 +5083,80 @@ def _zalo_pre_tool_call_hook(
                         "không xem được nội dung nhóm khác."
                     ),
                 }
+        if base_name == "zalo_create_reminder":
+            # Nhắc hẹn native cho non-owner: (a) CHỈ đúng chat hiện tại (chống
+            # đặt nhắc hộ nhóm khác), (b) rate-limit chống spam ping cả nhóm.
+            try:
+                p = _extract_tool_params(args, kwargs)
+            except Exception:
+                p = {}
+            req_chat = (
+                _coerce_str_arg(p.get("chat_id", "")) if isinstance(p, dict) else ""
+            )
+            if req_chat and current_chat_id and req_chat != current_chat_id:
+                logger.warning(
+                    f"[zalo-personal] BLOCKED create_reminder cross-chat: "
+                    f"requested={req_chat} current_chat={current_chat_id} "
+                    f"user_id={user_id} (session {session_id})"
+                )
+                return {
+                    "action": "block",
+                    "message": (
+                        "Em chỉ đặt nhắc được cho đúng nhóm/chat mình đang trò "
+                        "chuyện thôi ạ, không đặt hộ nhóm khác được."
+                    ),
+                }
+            quota_err = _hourly_quota_check(
+                _reminder_state_path(), current_chat_id, user_id,
+                _REMINDER_PER_CHAT_HOUR, _REMINDER_PER_USER_HOUR,
+                f"Nhóm này đã đặt đủ {_REMINDER_PER_CHAT_HOUR} nhắc trong 1 tiếng.",
+                f"Bạn đã đặt đủ {_REMINDER_PER_USER_HOUR} nhắc trong 1 tiếng.",
+            )
+            if quota_err:
+                return {"action": "block", "message": quota_err + " Đợi chút rồi thử lại nha."}
+            _hourly_quota_bump(_reminder_state_path(), current_chat_id, user_id)
+            return None
+        if base_name == "zalo_schedule_reminder":
+            # Nhắc ĐỘNG (tin chat + tag): (a) chỉ NHÓM (tag vô nghĩa ở DM),
+            # (b) chỉ chat hiện tại, (c) rate-limit riêng chống spam ping.
+            if _infer_zalo_thread_type(current_chat_id) != "group":
+                return {
+                    "action": "block",
+                    "message": (
+                        "Nhắc kèm tag chỉ dùng trong NHÓM ạ. Ở chat riêng, anh/chị "
+                        "dùng 'đặt nhắc hẹn Zalo' nha."
+                    ),
+                }
+            try:
+                p = _extract_tool_params(args, kwargs)
+            except Exception:
+                p = {}
+            req_chat = (
+                _coerce_str_arg(p.get("chat_id", "")) if isinstance(p, dict) else ""
+            )
+            if req_chat and current_chat_id and req_chat != current_chat_id:
+                logger.warning(
+                    f"[zalo-personal] BLOCKED schedule_reminder cross-chat: "
+                    f"requested={req_chat} current_chat={current_chat_id} "
+                    f"user_id={user_id} (session {session_id})"
+                )
+                return {
+                    "action": "block",
+                    "message": (
+                        "Em chỉ đặt nhắc cho đúng nhóm mình đang trò chuyện thôi ạ, "
+                        "không đặt hộ nhóm khác được."
+                    ),
+                }
+            quota_err = _hourly_quota_check(
+                _schedule_reminder_quota_path(), current_chat_id, user_id,
+                _SCHEDULE_REMINDER_PER_CHAT_HOUR, _SCHEDULE_REMINDER_PER_USER_HOUR,
+                f"Nhóm này đã đặt đủ {_SCHEDULE_REMINDER_PER_CHAT_HOUR} nhắc trong 1 tiếng.",
+                f"Bạn đã đặt đủ {_SCHEDULE_REMINDER_PER_USER_HOUR} nhắc trong 1 tiếng.",
+            )
+            if quota_err:
+                return {"action": "block", "message": quota_err + " Đợi chút rồi thử lại nha."}
+            _hourly_quota_bump(_schedule_reminder_quota_path(), current_chat_id, user_id)
+            return None
         return None
 
     # Mọi tool còn lại: từ chối. Phân biệt log "known-blocked" với "unknown"
@@ -3474,11 +5182,39 @@ def _zalo_pre_tool_call_hook(
     return _deny_msg
 
 
+def _redact_ipv4(m: "re.Match") -> str:
+    """Redact only dotted-quads that can actually be an IPv4 address.
+
+    Vietnamese prices use "." as the thousands separator, so "1.000.000.000
+    VNĐ" is a dotted-quad too. Real addresses never carry leading zeros
+    ("192.168.001.1") and never exceed 255 per octet, which is enough to tell
+    a billion đồng apart from a host.
+    """
+    octets = m.group(0).split(".")
+    for o in octets:
+        if len(o) > 1 and o[0] == "0":
+            return m.group(0)
+        if int(o) > 255:
+            return m.group(0)
+    return "[ip-ẩn]"
+
+
+# An IPv6 address either compresses a run of zeroes with "::" or spells out
+# all 8 hextets. Anything with fewer colons is prose — "10:12" is a clock,
+# not a host. Boundaries reject "std::vector" and partial dotted-quads.
+_IPV6_RE = re.compile(
+    r"(?<![0-9A-Za-z:.])(?:"
+    r"(?:[0-9A-Fa-f]{1,4}:){7}[0-9A-Fa-f]{1,4}"                       # full 8-hextet
+    r"|(?:[0-9A-Fa-f]{1,4}:){1,7}:(?:[0-9A-Fa-f]{1,4}(?::[0-9A-Fa-f]{1,4}){0,6})?"  # a::b
+    r"|::(?:[0-9A-Fa-f]{1,4}(?::[0-9A-Fa-f]{1,4}){0,7})"              # ::b
+    r")(?![0-9A-Za-z:.])"
+)
+
 # Output post-filter — last line of defence. If the model leaked anything
 # the tool gate didn't catch, scrub these patterns from outgoing replies.
 _LEAK_REDACT_REGEXES = [
-    (re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b"), "[ip-ẩn]"),                    # IPv4
-    (re.compile(r"\b[0-9a-fA-F:]{2,}:[0-9a-fA-F:]{2,}\b"), "[ip-ẩn]"),           # IPv6 (loose)
+    (re.compile(r"(?<![\d.])(?:\d{1,3}\.){3}\d{1,3}(?![\d.])"), _redact_ipv4),   # IPv4
+    (_IPV6_RE, "[ip-ẩn]"),                                                       # IPv6
     (re.compile(r"/opt/[\w./\-]+", re.IGNORECASE), "[path-ẩn]"),
     (re.compile(r"/etc/[\w./\-]+", re.IGNORECASE), "[path-ẩn]"),
     (re.compile(r"/root/[\w./\-]+", re.IGNORECASE), "[path-ẩn]"),
@@ -3525,8 +5261,34 @@ def _scrub_leak(text: str) -> str:
 # (e.g. owner DMs "tóm tắt group X" → agent calls zalo_group_summary).
 # ---------------------------------------------------------------------------
 
+_HERMES_HOME_CACHE: Optional[Path] = None
+
+
 def _hermes_home() -> Path:
-    return Path(os.getenv("HERMES_HOME", "/opt/data"))
+    """Thư mục data Hermes (chứa sessions/sessions.json).
+
+    Thứ tự: env HERMES_HOME → /opt/data → ~/.hermes → /opt/hermes/data.
+    Tự dò nơi THỰC SỰ có sessions/sessions.json vì trên một số server
+    HERMES_HOME không được export sang process plugin — nếu trỏ sai,
+    owner-gate fail-closed sẽ chặn mọi tool zalo_* kể cả của owner
+    ("unresolved session"). Cache kết quả dò ĐƯỢC (positive) để khỏi
+    stat lặp lại mỗi tool call; chưa dò được thì thử lại lần sau."""
+    global _HERMES_HOME_CACHE
+    env = os.getenv("HERMES_HOME")
+    if env:
+        return Path(env)
+    if _HERMES_HOME_CACHE is not None:
+        return _HERMES_HOME_CACHE
+    for cand in (Path("/opt/data"), Path.home() / ".hermes", Path("/opt/hermes/data")):
+        try:
+            if (cand / "sessions" / "sessions.json").exists():
+                _HERMES_HOME_CACHE = cand
+                if cand != Path("/opt/data"):
+                    logger.warning(f"[zalo-personal] HERMES_HOME không set — tự dò ra data dir: {cand}")
+                return cand
+        except Exception:
+            continue
+    return Path("/opt/data")
 
 
 def _load_sessions_json() -> Dict[str, Any]:
@@ -3814,18 +5576,41 @@ def _bot_persona_path() -> Path:
     ) / "bot_persona.json"
 
 
-def _load_bot_persona() -> Dict[str, str]:
+def _load_bot_persona() -> Dict[str, Any]:
     path = _bot_persona_path()
-    persona = dict(_DEFAULT_PERSONA)
+    persona: Dict[str, Any] = dict(_DEFAULT_PERSONA)
     try:
         if path.exists():
             with open(path, encoding="utf-8") as f:
                 data = json.load(f)
                 if isinstance(data, dict):
-                    for k in ("name", "self_intro", "personality"):
+                    for k in (
+                        "name",
+                        "self_intro",
+                        "personality",
+                        # Runtime-configured group welcome template. Kept in
+                        # bot_persona.json (outside the plugin) so operator
+                        # edits survive plugin updates. Current adapter code
+                        # consumes this for member-join greetings; older code
+                        # safely ignores it.
+                        "group_welcome_text",
+                    ):
                         v = data.get(k)
                         if isinstance(v, str) and v.strip():
                             persona[k] = v.strip()
+                    if isinstance(data.get("group_member_welcome_enabled"), bool):
+                        persona["group_member_welcome_enabled"] = data[
+                            "group_member_welcome_enabled"
+                        ]
+                    # Canned-notice overrides (soft_error/recovery/deny_non_owner).
+                    # Must survive the load→save roundtrip of zalo_set_persona.
+                    notices = data.get("notices")
+                    if isinstance(notices, dict):
+                        persona["notices"] = {
+                            str(k): str(v).strip()
+                            for k, v in notices.items()
+                            if isinstance(v, str) and v.strip()
+                        }
     except Exception as e:
         logger.debug(f"[zalo-personal] load bot_persona failed: {e}")
     return persona
@@ -3854,6 +5639,7 @@ def _zalo_set_persona_handler(args: Any = None, **kwargs) -> Dict[str, Any]:
     name = p.get("name", "")
     self_intro = p.get("self_intro", "")
     personality = p.get("personality", "")
+    notices_in = p.get("notices")
     persona = _load_bot_persona()
     changed: List[str] = []
     name_s = _coerce_str_arg(name)
@@ -3868,10 +5654,38 @@ def _zalo_set_persona_handler(args: Any = None, **kwargs) -> Dict[str, Any]:
     if persona_s:
         persona["personality"] = persona_s
         changed.append("personality")
+    # Canned notices theo persona — các câu hệ thống gửi thẳng ra khách (không
+    # qua model): soft_error / recovery / deny_non_owner. Câu phải "sạch"
+    # (không trùng pattern thông báo vận hành) và <=300 ký tự, nếu không bị bỏ qua.
+    _ALLOWED_NOTICE_KEYS = ("soft_error", "recovery", "deny_non_owner")
+    if isinstance(notices_in, str):
+        try:
+            notices_in = json.loads(notices_in)
+        except Exception:
+            notices_in = None
+    if isinstance(notices_in, dict):
+        cur = dict(persona.get("notices") or {})
+        rejected: List[str] = []
+        for k in _ALLOWED_NOTICE_KEYS:
+            v = notices_in.get(k)
+            if not isinstance(v, str) or not v.strip():
+                continue
+            v = v.strip()
+            # validate qua resolve_notice: chỉ nhận câu classify KEEP + trong cap
+            if _msgfilter.resolve_notice({"notices": {k: v}}, k, "") == v:
+                cur[k] = v
+                changed.append(f"notices.{k}")
+            else:
+                rejected.append(k)
+        if cur:
+            persona["notices"] = cur
+        if rejected:
+            logger.info("[zalo-personal] persona notices rejected (unsafe/too long): %s", rejected)
     if not changed:
         return {
             "success": False,
-            "error": "Không có trường nào được set. Truyền ít nhất 1 trong: name, self_intro, personality.",
+            "error": ("Không có trường nào được set. Truyền ít nhất 1 trong: name, "
+                      "self_intro, personality, notices{soft_error,recovery,deny_non_owner}."),
             "current": persona,
         }
     _save_bot_persona(persona)
@@ -3909,11 +5723,13 @@ def _zalo_reset_persona_handler(*args, **kwargs) -> Dict[str, Any]:
 # Valid chat-mode values.
 #   "default"      → fall back to global env (require_mention/observe etc.)
 #   "active"       → respond to every message (no mention required)
-#   "mention_only" → only respond when @-mentioned or reply-to-bot
+#   "active_mention_only" → observe every message, but only respond when
+#                            @-mentioned / name-mentioned / reply-to-bot
+#   "mention_only" → only respond when @-mentioned/name-mentioned or reply-to-bot
 #   "listen_only"  → observe & accumulate context but NEVER reply
 #   "mute"         → ignore everything from this chat (no observe, no reply)
 _VALID_CHAT_MODES = {
-    "default", "active", "mention_only", "listen_only", "mute",
+    "default", "active", "active_mention_only", "mention_only", "listen_only", "mute",
     # Sales mode — bot tự reply mọi tin trong group như nhân viên, có khả
     # năng tự gợi ý sản phẩm từ product_catalog.json khi phát hiện cơ hội.
     # Owner KHÔNG cần duyệt. Có safety guard: cooldown giữa các pitch, daily
@@ -4546,6 +6362,8 @@ def _resolve_current_chat_id_from_task(task_id: str) -> str:
     except Exception:
         return ""
     for sess in sjson.values():
+        if not isinstance(sess, dict):
+            continue  # bỏ qua entry sentinel không phải session (vd key "_README")
         if (
             sess.get("platform") == "zalo-personal"
             and sess.get("session_id") == task_id
@@ -5408,6 +7226,107 @@ def _zalo_send_html_handler(args: Any = None, **kwargs) -> Dict[str, Any]:
     return _finalise_file_send(ctx, "zalo_send_html")
 
 
+# ── Gửi file bất kỳ CÓ SẴN (URL/local) vào Zalo ───────────────────────────
+# Lấp tool còn thiếu: các zalo_send_* khác đều RENDER nội dung (html→pdf,
+# spec→pptx/xlsx, base64→image). Khi agent ĐÃ có sẵn 1 file/URL (vd .docx do
+# MCP hitechcloud tạo tại https://mcp.hitechcloud.vn/media/...), trước đây không tool nào đẩy
+# được nên bot đành dán link tải. zalo_send_file lấp đúng khoảng trống đó.
+_SEND_FILE_MAX_BYTES = 50 * 1024 * 1024  # 50MB — khớp trần media của sidecar
+
+
+def _is_safe_public_url(url: str) -> Optional[str]:
+    """Trả chuỗi lỗi nếu URL KHÔNG an toàn để tải server-side (sai scheme, hoặc
+    host phân giải về IP nội bộ/loopback → chống SSRF vào service nội bộ như
+    mgmt:9997, rag:9998, dashboard:9119). Trả None nếu an toàn."""
+    try:
+        from urllib.parse import urlparse
+        import socket
+        import ipaddress
+        u = urlparse(url)
+        if u.scheme not in ("http", "https"):
+            return "URL phải bắt đầu bằng http:// hoặc https://."
+        host = u.hostname
+        if not host:
+            return "URL không hợp lệ (thiếu host)."
+        port = u.port or (443 if u.scheme == "https" else 80)
+        for info in socket.getaddrinfo(host, port, proto=socket.IPPROTO_TCP):
+            ip = ipaddress.ip_address(info[4][0])
+            if (ip.is_private or ip.is_loopback or ip.is_link_local
+                    or ip.is_reserved or ip.is_multicast or ip.is_unspecified):
+                return "URL trỏ tới địa chỉ nội bộ — từ chối để chống SSRF."
+        return None
+    except Exception as e:
+        return f"Không kiểm tra được URL ({e})."
+
+
+def _download_url_capped(url: str, max_bytes: int = _SEND_FILE_MAX_BYTES):
+    """Tải tối đa max_bytes+1 byte để phát hiện vượt trần. Trả (data, err)."""
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "Hermes/1.0"})
+        with urllib.request.urlopen(req, timeout=60) as r:
+            data = r.read(max_bytes + 1)
+    except Exception as e:
+        return None, f"Tải file thất bại: {e}"
+    if not data:
+        return None, "Tải file về rỗng (0 byte)."
+    if len(data) > max_bytes:
+        return None, f"File quá lớn (>{max_bytes // (1024 * 1024)}MB), không gửi được."
+    return data, None
+
+
+def _zalo_send_file_handler(args: Any = None, **kwargs) -> Dict[str, Any]:
+    """Gửi MỘT file có sẵn vào chat Zalo — nhận 'url' công khai hoặc 'file_path'
+    local. KHÔNG render (render dùng zalo_send_pdf/xlsx/pptx). Cùng rate-limit &
+    plumbing như các zalo_send_* khác; người ngoài owner cũng gọi được."""
+    from urllib.parse import urlparse
+
+    p = _extract_tool_params(args, kwargs)
+    url = _coerce_str_arg(p.get("url", "") or p.get("file_url", ""))
+    file_path = _coerce_str_arg(p.get("file_path", ""))
+    filename = _coerce_str_arg(p.get("filename", ""))
+
+    if not url and not file_path:
+        return {
+            "success": False,
+            "error": "Thiếu 'url' (hoặc 'file_path'). Truyền URL công khai của file cần gửi.",
+        }
+
+    if url:
+        guard = _is_safe_public_url(url)
+        if guard:
+            return {"success": False, "error": guard}
+        data, err = _download_url_capped(url)
+        if err:
+            return {"success": False, "error": err}
+        src_name = filename or os.path.basename(urlparse(url).path) or "document"
+    else:
+        try:
+            pth = Path(file_path)
+            if not pth.exists() or not pth.is_file():
+                return {"success": False, "error": f"file không tồn tại: {file_path}"}
+            if pth.stat().st_size > _SEND_FILE_MAX_BYTES:
+                return {"success": False, "error": "File quá lớn (>50MB), không gửi được."}
+            data = pth.read_bytes()
+        except Exception as e:
+            return {"success": False, "error": f"đọc file local thất bại: {e}"}
+        src_name = filename or Path(file_path).name
+
+    ext = os.path.splitext(src_name)[1].lower() or ".bin"
+
+    # Tái dùng prep chung (resolve chat_id, quota, thread_type, upload path).
+    # Ép filename đã suy ra vào params để giữ tên gốc + đúng đuôi.
+    merged = dict(p)
+    merged["filename"] = src_name
+    ctx = _prepare_file_send(merged, kwargs, required_ext=ext, default_stem="document")
+    if not ctx.get("ok"):
+        return {"success": False, "error": ctx.get("error")}
+    try:
+        ctx["out_path"].write_bytes(data)
+    except Exception as e:
+        return {"success": False, "error": f"file write failed: {e}"}
+    return _finalise_file_send(ctx, "zalo_send_file", extra={"size_bytes": len(data)})
+
+
 def _zalo_send_pdf_handler(args: Any = None, **kwargs) -> Dict[str, Any]:
     """Render the provided HTML into a PDF (via WeasyPrint) and send it
     to the Zalo chat. Non-owner allowed (same quota as HTML)."""
@@ -5440,6 +7359,134 @@ def _zalo_send_pdf_handler(args: Any = None, **kwargs) -> Dict[str, Any]:
     except Exception as e:
         return {"success": False, "error": f"PDF render failed: {e}"}
     return _finalise_file_send(ctx, "zalo_send_pdf")
+
+
+def _detect_image_ext(data: bytes) -> Optional[str]:
+    """Validate real image via magic bytes. Return an extension (.png/.jpg/
+    .gif/.webp) or None if the bytes are not a recognised image."""
+    if len(data) < 12:
+        return None
+    if data[:8] == b"\x89PNG\r\n\x1a\n":
+        return ".png"
+    if data[:3] == b"\xff\xd8\xff":
+        return ".jpg"
+    if data[:4] in (b"GIF8", b"GIF9") or data[:6] in (b"GIF87a", b"GIF89a"):
+        return ".gif"
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return ".webp"
+    return None
+
+
+def _image_bytes_look_complete(data: bytes, ext: str) -> bool:
+    """Best-effort truncation check for OUTBOUND images (send path).
+
+    Prefer a real Pillow decode when available; otherwise fall back to
+    container-terminator / declared-length checks so a half-downloaded image is
+    not sent as a broken photo. (Inbound uses magic-byte sniffing separately.)
+    """
+    try:
+        from io import BytesIO
+        from PIL import Image  # type: ignore
+
+        with Image.open(BytesIO(data)) as img:
+            img.verify()
+        with Image.open(BytesIO(data)) as img:
+            img.load()
+            return img.width > 0 and img.height > 0
+    except ImportError:
+        pass
+    except Exception:
+        return False
+
+    if ext == ".jpg":
+        trimmed = data.rstrip(b"\x00\r\n\t ")
+        return b"\xff\xda" in data and trimmed.endswith(b"\xff\xd9")
+    if ext == ".png":
+        return (
+            data.startswith(b"\x89PNG\r\n\x1a\n")
+            and data.endswith(b"\x00\x00\x00\x00IEND\xaeB`\x82")
+        )
+    if ext == ".gif":
+        return data[:6] in (b"GIF87a", b"GIF89a") and data.rstrip().endswith(b";")
+    if ext == ".webp":
+        if len(data) < 12 or data[:4] != b"RIFF" or data[8:12] != b"WEBP":
+            return False
+        declared = int.from_bytes(data[4:8], "little") + 8
+        return 12 <= declared <= len(data)
+    return False
+
+
+def _zalo_send_image_handler(args: Any = None, **kwargs) -> Dict[str, Any]:
+    """Gửi ẢNH thật vào Zalo chat. Ảnh lấy từ MỘT trong hai nguồn:
+    - image_base64: chuỗi base64 (mã QR từ tao_qr, ảnh từ ve_anh...).
+    - image_url: link ảnh http NỘI BỘ (vd qr_url/url từ media_store mcp.hitechcloud.vn).
+      Adapter tải server-side (chỉ https + host cho phép, chống SSRF) — bytes/URL
+      KHÔNG lộ cho khách, base64 không phải đi qua LLM.
+    Same rate-limit/plumbing. Non-owner OK. TUYỆT ĐỐI KHÔNG dán base64/URL vào
+    tin nhắn text."""
+    import base64 as _base64
+
+    p = _extract_tool_params(args, kwargs)
+    image_b64 = _coerce_str_arg(p.get("image_base64", ""))
+    image_url = _coerce_str_arg(p.get("image_url", ""))
+
+    if image_b64.strip():
+        # Strip optional data URI prefix: data:image/png;base64,....
+        raw_b64 = image_b64.strip()
+        if raw_b64.startswith("data:"):
+            comma = raw_b64.find(",")
+            if comma != -1:
+                raw_b64 = raw_b64[comma + 1:]
+        # Remove whitespace/newlines that models sometimes insert.
+        raw_b64 = re.sub(r"\s+", "", raw_b64)
+        try:
+            data = _base64.b64decode(raw_b64, validate=False)
+        except Exception as e:
+            return {
+                "success": False,
+                "error": f"Chuỗi base64 không hợp lệ, không decode được ({e}).",
+            }
+    elif image_url.strip():
+        # Tải ảnh server-side với allowlist host (mặc định mcp.hitechcloud.vn) + chống
+        # SSRF/redirect. env ZALO_IMAGE_URL_ALLOWED_HOSTS mở rộng nếu cần.
+        allowed = _resolve_image_allowed_hosts(os.environ.get("ZALO_IMAGE_URL_ALLOWED_HOSTS"))
+        try:
+            data, _ = _fetch_image_from_url(image_url.strip(), allowed_hosts=allowed)
+        except _ImageUrlError as e:
+            return {"success": False, "error": f"Không lấy được ảnh từ image_url: {e}."}
+        except Exception as e:  # noqa: BLE001
+            return {"success": False, "error": f"Lỗi tải ảnh từ image_url: {e}."}
+    else:
+        return {
+            "success": False,
+            "error": "Thiếu ảnh: truyền image_base64 HOẶC image_url (1 trong 2).",
+        }
+
+    if not data:
+        return {"success": False, "error": "Ảnh rỗng sau khi decode/tải."}
+    if len(data) > 10_485_760:
+        return {"success": False, "error": "Ảnh quá lớn (>10MB), không gửi được."}
+
+    ext = _detect_image_ext(data)
+    if ext is None or not _image_bytes_look_complete(data, ext):
+        return {
+            "success": False,
+            "error": (
+                "Dữ liệu không phải ảnh hợp lệ hoặc bị cắt dở (chỉ nhận "
+                "PNG/JPEG/GIF/WebP đầy đủ). Kiểm tra lại nguồn ảnh (base64/URL)."
+            ),
+        }
+
+    ctx = _prepare_file_send(args, kwargs, required_ext=ext, default_stem="image")
+    if not ctx.get("ok"):
+        return {"success": False, "error": ctx.get("error")}
+    try:
+        ctx["out_path"].write_bytes(data)
+    except Exception as e:
+        return {"success": False, "error": f"file write failed: {e}"}
+    return _finalise_file_send(
+        ctx, "zalo_send_image", extra={"size_bytes": len(data)}
+    )
 
 
 def _zalo_send_pptx_handler(args: Any = None, **kwargs) -> Dict[str, Any]:
@@ -6488,6 +8535,510 @@ def _set_channel_active_handler(args=None, **kwargs):
 
 
 # ═══════════════════════════════════════════════════════════════════════
+# ZCA-JS PASSTHROUGH — poll / note / reminder / friend-accept / đọc ảnh /
+# generic api_call. Mọi method zca-js đi qua sidecar POST /api/call.
+# ═══════════════════════════════════════════════════════════════════════
+def _post_sidecar_api(method: str, call_args: List[Any], timeout: int = 30) -> Dict[str, Any]:
+    """Gọi generic passthrough /api/call của sidecar → bất kỳ method zca-js.
+
+    Trả dict {ok, result} hoặc {error}. ThreadType truyền số: User=0, Group=1."""
+    import urllib.request
+    import urllib.error
+    port = int(os.getenv("ZALO_PERSONAL_SIDECAR_PORT", "3838"))
+    body = json.dumps({"method": method, "args": call_args}).encode("utf-8")
+    req = urllib.request.Request(
+        "http://127.0.0.1:%d/api/call" % port, data=body,
+        headers={"Content-Type": "application/json"}, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.loads(r.read().decode("utf-8", "replace"))
+    except urllib.error.HTTPError as e:
+        try:
+            return json.loads(e.read().decode("utf-8", "replace"))
+        except Exception:
+            return {"error": "HTTP %s" % e.code}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def _zalo_thread_type_num(chat_id: str) -> int:
+    """ThreadType số cho zca-js: User=0, Group=1."""
+    return 1 if _infer_zalo_thread_type(chat_id) == "group" else 0
+
+
+def _tool_chat_id(p: Dict[str, Any], kwargs: Dict[str, Any]) -> str:
+    """chat_id từ param hoặc fallback chat hiện tại của task."""
+    cid = _coerce_str_arg(p.get("chat_id", ""))
+    if not cid:
+        cid = _resolve_current_chat_id_from_task(_coerce_str_arg(kwargs.get("task_id", "")))
+    return cid
+
+
+def _zalo_create_poll_handler(args: Any = None, **kwargs) -> Dict[str, Any]:
+    """Tạo poll (bình chọn) trong group."""
+    p = _extract_tool_params(args, kwargs)
+    chat_id = _tool_chat_id(p, kwargs)
+    question = _coerce_str_arg(p.get("question", ""))
+    options = p.get("options") or []
+    if isinstance(options, str):
+        sep = "\n" if "\n" in options else ","
+        options = [o.strip() for o in options.split(sep) if o.strip()]
+    options = [str(o).strip() for o in options if str(o).strip()]
+    if not chat_id:
+        return {"success": False, "error": "chat_id required"}
+    if _infer_zalo_thread_type(chat_id) != "group":
+        return {"success": False, "error": "Poll chỉ tạo được trong NHÓM, không tạo được trong chat 1-1."}
+    if not question or len(options) < 2:
+        return {"success": False, "error": "Cần question và ít nhất 2 options."}
+    opts: Dict[str, Any] = {
+        "question": question,
+        "options": options[:10],
+        "allowMultiChoices": bool(p.get("multi_choice", False)),
+        "allowAddNewOption": bool(p.get("allow_add_option", False)),
+        "hideVotePreview": bool(p.get("hide_results", False)),
+        "isAnonymous": bool(p.get("anonymous", False)),
+    }
+    try:
+        hours = float(p.get("expires_hours") or 0)
+    except Exception:
+        hours = 0
+    if hours > 0:
+        opts["expiredTime"] = int((time.time() + hours * 3600) * 1000)
+    r = _post_sidecar_api("createPoll", [opts, str(chat_id)])
+    if r.get("error"):
+        return {"success": False, "error": r["error"]}
+    poll = r.get("result") or {}
+    return {"success": True, "poll_id": poll.get("id") or poll.get("poll_id"),
+            "question": question, "options": opts["options"],
+            "hint": "Poll đã tạo trong nhóm. Báo NGẮN gọn, kèm poll_id nếu sếp cần khoá/xem kết quả sau."}
+
+
+def _zalo_create_note_handler(args: Any = None, **kwargs) -> Dict[str, Any]:
+    """Tạo ghi chú (note) trên bảng tin nhóm."""
+    p = _extract_tool_params(args, kwargs)
+    chat_id = _tool_chat_id(p, kwargs)
+    title = _coerce_str_arg(p.get("title", "")) or _coerce_str_arg(p.get("content", ""))
+    if not chat_id:
+        return {"success": False, "error": "chat_id required"}
+    if _infer_zalo_thread_type(chat_id) != "group":
+        return {"success": False, "error": "Ghi chú chỉ tạo được trong NHÓM."}
+    if not title:
+        return {"success": False, "error": "title (nội dung ghi chú) required"}
+    r = _post_sidecar_api("createNote", [{"title": title, "pinAct": bool(p.get("pin", False))}, str(chat_id)])
+    if r.get("error"):
+        return {"success": False, "error": r["error"]}
+    note = r.get("result") or {}
+    return {"success": True, "topic_id": note.get("id") or note.get("topicId"),
+            "hint": "Ghi chú đã đăng lên bảng tin nhóm. Báo NGẮN gọn."}
+
+
+_REMINDER_REPEAT = {"none": 0, "daily": 1, "weekly": 2, "monthly": 3}
+
+
+def _zalo_create_reminder_handler(args: Any = None, **kwargs) -> Dict[str, Any]:
+    """Tạo nhắc hẹn Zalo (chat 1-1 hoặc nhóm)."""
+    p = _extract_tool_params(args, kwargs)
+    chat_id = _tool_chat_id(p, kwargs)
+    title = _coerce_str_arg(p.get("title", ""))
+    if not chat_id or not title:
+        return {"success": False, "error": "chat_id và title required"}
+    opts: Dict[str, Any] = {"title": title}
+    emoji = _coerce_str_arg(p.get("emoji", ""))
+    if emoji:
+        opts["emoji"] = emoji
+    # Thời điểm nhắc: "at" = "YYYY-MM-DD HH:MM" (giờ máy chủ) hoặc
+    # "in_minutes" = số phút kể từ bây giờ. Bỏ trống = nhắc ngay.
+    at_str = _coerce_str_arg(p.get("at", ""))
+    start_ms: Optional[int] = None
+    if at_str:
+        import datetime
+        from zoneinfo import ZoneInfo
+        _tz_vn = ZoneInfo("Asia/Ho_Chi_Minh")  # cố định giờ VN, không phụ thuộc TZ máy chủ
+        for fmt in ("%Y-%m-%d %H:%M", "%Y-%m-%dT%H:%M", "%d/%m/%Y %H:%M"):
+            try:
+                dt = datetime.datetime.strptime(at_str, fmt).replace(tzinfo=_tz_vn)
+                start_ms = int(dt.timestamp() * 1000)
+                break
+            except ValueError:
+                continue
+        if start_ms is None:
+            return {"success": False, "error": "at không đúng định dạng 'YYYY-MM-DD HH:MM'"}
+    else:
+        try:
+            mins = float(p.get("in_minutes") or 0)
+        except Exception:
+            mins = 0
+        if mins > 0:
+            start_ms = int((time.time() + mins * 60) * 1000)
+    if start_ms is not None:
+        opts["startTime"] = start_ms
+    repeat = _coerce_str_arg(p.get("repeat", "none")).lower()
+    opts["repeat"] = _REMINDER_REPEAT.get(repeat, 0)
+    r = _post_sidecar_api("createReminder", [opts, str(chat_id), _zalo_thread_type_num(chat_id)])
+    if r.get("error"):
+        return {"success": False, "error": r["error"]}
+    rem = r.get("result") or {}
+    return {"success": True, "reminder_id": rem.get("id") or rem.get("reminderId"),
+            "hint": "Nhắc hẹn đã tạo trên Zalo. Báo NGẮN gọn kèm thời gian nhắc."}
+
+
+def _parse_vn_epoch(s: str) -> Optional[float]:
+    """'YYYY-MM-DD HH:MM' (giờ VN) → epoch giây. None nếu sai định dạng."""
+    s = (s or "").strip()
+    if not s:
+        return None
+    import datetime
+    from zoneinfo import ZoneInfo
+    _tz_vn = ZoneInfo("Asia/Ho_Chi_Minh")
+    for fmt in ("%Y-%m-%d %H:%M", "%Y-%m-%dT%H:%M", "%d/%m/%Y %H:%M", "%H:%M"):
+        try:
+            dt = datetime.datetime.strptime(s, fmt)
+            if fmt == "%H:%M":  # chỉ giờ → hôm nay (giờ VN); nếu đã qua → mai
+                today = datetime.datetime.now(_tz_vn)
+                dt = dt.replace(
+                    year=today.year, month=today.month, day=today.day, tzinfo=_tz_vn
+                )
+                if dt.timestamp() <= today.timestamp():
+                    dt = dt + datetime.timedelta(days=1)
+                return dt.timestamp()
+            dt = dt.replace(tzinfo=_tz_vn)
+            return dt.timestamp()
+        except ValueError:
+            continue
+    return None
+
+
+def _zalo_schedule_reminder_handler(args: Any = None, **kwargs) -> Dict[str, Any]:
+    """Đặt nhắc ĐỘNG kiểu Osin trong NHÓM: tới giờ bot bắn TIN CHAT tag @người,
+    nội dung soạn bằng LLM toolless lúc nổ (fallback template). Escalation nhiều
+    lần nếu có 'deadline' + 'max_attempts'. Chỉ dùng trong nhóm.
+    (Guards group-only/current-chat/rate-limit đã ép ở cổng non-owner.)"""
+    import uuid
+    p = _extract_tool_params(args, kwargs)
+    chat_id = _tool_chat_id(p, kwargs)
+    task = _coerce_str_arg(p.get("task", "")) or _coerce_str_arg(p.get("title", ""))
+    target = (
+        _coerce_str_arg(p.get("target", ""))
+        or _coerce_str_arg(p.get("who", ""))
+        or _coerce_str_arg(p.get("target_display", ""))
+    )
+    if not chat_id or not task:
+        return {"success": False, "error": "chat_id và task (việc cần nhắc) required"}
+    if _infer_zalo_thread_type(chat_id) != "group":
+        return {"success": False, "error": "Nhắc kèm tag chỉ đặt được trong nhóm."}
+
+    now = time.time()
+    # Thời điểm bắt đầu nhắc: 'at' (YYYY-MM-DD HH:MM giờ VN) hoặc in_minutes.
+    at_str = _coerce_str_arg(p.get("at", ""))
+    start_at: Optional[float] = None
+    if at_str:
+        start_at = _parse_vn_epoch(at_str)
+        if start_at is None:
+            return {"success": False, "error": "at sai định dạng 'YYYY-MM-DD HH:MM'"}
+    else:
+        try:
+            mins = float(p.get("in_minutes") or 0)
+        except Exception:
+            mins = 0
+        if mins > 0:
+            start_at = now + mins * 60
+    if not start_at or start_at <= now - 60:
+        return {"success": False, "error": "Cần thời điểm: 'in_minutes' (N phút nữa) hoặc 'at' 'YYYY-MM-DD HH:MM'."}
+
+    # Hạn chót (tùy chọn) → cho phép escalation nhiều lần tới hạn.
+    deadline_at: Optional[float] = None
+    dl_str = _coerce_str_arg(p.get("deadline", ""))
+    if dl_str:
+        deadline_at = _parse_vn_epoch(dl_str)
+    elif p.get("deadline_in_minutes"):
+        try:
+            dmins = float(p.get("deadline_in_minutes") or 0)
+        except Exception:
+            dmins = 0
+        if dmins > 0:
+            deadline_at = now + dmins * 60
+
+    try:
+        max_att = int(p.get("max_attempts") or (3 if deadline_at else 1))
+    except Exception:
+        max_att = 3 if deadline_at else 1
+    max_att = max(1, min(5, max_att))
+
+    fire_times = _rsched.compute_fire_times(start_at, deadline_at, max_att)
+    rec = {
+        "id": uuid.uuid4().hex[:12],
+        "chat_id": str(chat_id),
+        "thread_type": "group",
+        "task": task,
+        "target_display": target,
+        "fire_times": fire_times,
+        "next_idx": 0,
+        "max_attempts": len(fire_times),
+        "deadline_at": deadline_at,
+        "created_by_uid": _coerce_str_arg(kwargs.get("user_id", "")),
+        "created_at": now,
+    }
+    try:
+        _rsched.add(_rsched.state_path(), rec)
+    except Exception as e:
+        logger.warning(f"[zalo-personal] schedule_reminder add failed: {e}")
+        return {"success": False, "error": "Không lưu được lịch nhắc, thử lại nha."}
+    return {
+        "success": True,
+        "reminder_id": rec["id"],
+        "attempts": len(fire_times),
+        "hint": (
+            "Đã đặt lịch nhắc trong nhóm. Tới giờ em sẽ tự nhắn tag người đó. "
+            "Báo NGẮN gọn cho người dùng (thời điểm + tên người được nhắc)."
+        ),
+    }
+
+
+def _zalo_board_action_handler(args: Any = None, **kwargs) -> Dict[str, Any]:
+    """Thao tác bảng tin nhóm: list / poll_detail / poll_lock / poll_vote /
+    note_edit / reminder_remove / reminder_list."""
+    p = _extract_tool_params(args, kwargs)
+    action = _coerce_str_arg(p.get("action", "")).lower()
+    chat_id = _tool_chat_id(p, kwargs)
+    if action == "list":
+        if not chat_id:
+            return {"success": False, "error": "chat_id required"}
+        r = _post_sidecar_api("getListBoard", [{"page": 1, "count": 20}, str(chat_id)])
+    elif action == "poll_detail":
+        try:
+            r = _post_sidecar_api("getPollDetail", [int(str(p.get("poll_id")))])
+        except (TypeError, ValueError):
+            return {"success": False, "error": "poll_id (số) required"}
+    elif action == "poll_lock":
+        try:
+            r = _post_sidecar_api("lockPoll", [int(str(p.get("poll_id")))])
+        except (TypeError, ValueError):
+            return {"success": False, "error": "poll_id (số) required"}
+    elif action == "poll_vote":
+        opt_ids = p.get("option_ids") or []
+        if isinstance(opt_ids, str):
+            opt_ids = [x.strip() for x in opt_ids.split(",") if x.strip()]
+        if not opt_ids:
+            return {"success": False, "error": "option_ids rỗng — cần ít nhất 1 lựa chọn để vote"}
+        try:
+            r = _post_sidecar_api("votePoll", [int(str(p.get("poll_id"))), [int(str(x)) for x in opt_ids]])
+        except (TypeError, ValueError):
+            return {"success": False, "error": "poll_id + option_ids (số) required"}
+    elif action == "note_edit":
+        topic_id = _coerce_str_arg(p.get("topic_id", ""))
+        title = _coerce_str_arg(p.get("title", ""))
+        if not chat_id or not topic_id or not title:
+            return {"success": False, "error": "chat_id, topic_id, title required"}
+        r = _post_sidecar_api("editNote", [
+            {"title": title, "topicId": topic_id, "pinAct": bool(p.get("pin", False))}, str(chat_id)])
+    elif action == "reminder_remove":
+        rid = _coerce_str_arg(p.get("reminder_id", ""))
+        if not chat_id or not rid:
+            return {"success": False, "error": "chat_id và reminder_id required"}
+        r = _post_sidecar_api("removeReminder", [rid, str(chat_id), _zalo_thread_type_num(chat_id)])
+    elif action == "reminder_list":
+        if not chat_id:
+            return {"success": False, "error": "chat_id required"}
+        r = _post_sidecar_api("getListReminder", [{"page": 1, "count": 20}, str(chat_id), _zalo_thread_type_num(chat_id)])
+    else:
+        return {"success": False, "error": "action không hợp lệ. Hợp lệ: list, poll_detail, poll_lock, "
+                                           "poll_vote, note_edit, reminder_remove, reminder_list"}
+    if r.get("error"):
+        return {"success": False, "error": r["error"]}
+    # Cắt bớt kết quả lớn để không phình context.
+    out = json.dumps(r.get("result"), ensure_ascii=False, default=str)
+    if len(out) > 6000:
+        out = out[:6000] + "...[cắt bớt]"
+    return {"success": True, "action": action, "result": out}
+
+
+def _zalo_friend_accept_handler(args: Any = None, **kwargs) -> Dict[str, Any]:
+    """Chấp nhận lời mời kết bạn từ uid chỉ định."""
+    p = _extract_tool_params(args, kwargs)
+    uid = _coerce_str_arg(p.get("uid", ""))
+    if not uid:
+        return {"success": False, "error": "uid required"}
+    r = _post_sidecar_api("acceptFriendRequest", [str(uid)])
+    if r.get("error"):
+        return {"success": False, "error": r["error"]}
+    logger.info("[zalo-personal] accepted friend request uid=%s" % uid)
+    return {"success": True, "uid": uid, "hint": "Đã chấp nhận kết bạn. Báo NGẮN gọn."}
+
+
+def _zalo_read_recent_image_handler(args: Any = None, **kwargs) -> Dict[str, Any]:
+    """Lấy đường dẫn ảnh GẦN NHẤT trong chat HIỆN TẠI để vision_analyze đọc.
+
+    Bảo mật: LUÔN ưu tiên chat hiện tại từ task — không cho peek chat khác."""
+    p = _extract_tool_params(args, kwargs)
+    # CHỈ nhận chat hiện tại từ task — KHÔNG fallback chat_id do model truyền
+    # (tool này allow non-owner; fallback sẽ mở đường peek ảnh chat khác).
+    chat_id = _resolve_current_chat_id_from_task(_coerce_str_arg(kwargs.get("task_id", "")))
+    if not chat_id:
+        return {"success": False, "error": "không xác định được chat hiện tại"}
+    try:
+        n = max(1, min(int(p.get("count") or 1), 5))
+    except (TypeError, ValueError):
+        n = 1
+    out = []
+    # recent() returns oldest→newest; present newest first for the agent.
+    for rec in reversed(_RECENT_IMAGES.recent(chat_id, count=n)):
+        try:
+            if Path(str(rec.local_path or "")).exists():
+                out.append({
+                    "path": rec.local_path,
+                    "from": rec.from_name or rec.from_uid or "",
+                    "caption": rec.caption or "",
+                })
+        except Exception:
+            continue
+    if not out:
+        return {"success": False,
+                "error": "Chưa có ảnh nào trong chat này (bot chỉ nhớ ảnh từ lúc chạy, giữ 5 ảnh gần nhất)."}
+    return {"success": True, "images": out,
+            "hint": "Gọi vision_analyze với từng path để đọc nội dung ảnh, rồi trả lời người dùng."}
+
+
+def _bridge_http_post(url: str, headers: Dict[str, str], body: Dict[str, Any]) -> Dict[str, Any]:
+    """POST JSON to the landing bridge with a bounded timeout and NO redirects.
+
+    A redirect could send the upload-only key to an attacker-controlled host, so
+    any 3xx is treated as failure.
+    """
+    data = json.dumps(body).encode("utf-8")
+    req = urllib.request.Request(url, data=data, headers=headers, method="POST")
+
+    class _NoRedirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, *a, **k):  # noqa: D401 - block all redirects
+            return None
+
+    opener = urllib.request.build_opener(_NoRedirect)
+    try:
+        with opener.open(req, timeout=90) as resp:
+            raw = resp.read().decode("utf-8", "replace")
+    except urllib.error.HTTPError as e:
+        raise _LandingBridgeError(f"HTTP {e.code}") from None
+    except Exception as e:
+        raise _LandingBridgeError(f"transport error: {e.__class__.__name__}") from None
+    try:
+        return json.loads(raw) if raw else {}
+    except Exception:
+        raise _LandingBridgeError("invalid JSON response") from None
+
+
+def _bridge_session_resolver(task_id: str) -> Optional[Dict[str, str]]:
+    """Resolve the trusted current Zalo session record from task_id.
+
+    Returns ``chat_id`` (recent-image namespace) and ``conv_id`` (the hitechcloud-MCP
+    conversation id used as X-Session). Hermes scopes hitechcloud landings by the Zalo
+    CHAT, so ``conv_id == chat_id`` — this makes the bridge's ownership check
+    identical to the agent's own landing_build/update, and lets a chat edit its
+    landing across Hermes session resets. Returns None on ambiguity (fail closed).
+    """
+    tid = _coerce_str_arg(task_id)
+    if not tid:
+        return None
+    try:
+        with open(_hermes_home() / "sessions" / "sessions.json", encoding="utf-8") as f:
+            sjson = json.load(f)
+    except Exception:
+        return None
+    for sess in sjson.values():
+        if not isinstance(sess, dict):
+            continue
+        if sess.get("platform") == "zalo-personal" and sess.get("session_id") == tid:
+            chat_id = str((sess.get("origin") or {}).get("chat_id") or "")
+            if chat_id:
+                return {"chat_id": chat_id, "conv_id": chat_id}
+    return None
+
+
+def _zalo_upload_recent_image_to_landing_handler(args: Any = None, **kwargs) -> Dict[str, Any]:
+    """Upload ảnh Zalo gần nhất của CHAT HIỆN TẠI vào landing (server-to-server).
+
+    Thay cho zalo_recent_image_base64: base64 KHÔNG bao giờ đi qua LLM. Chỉ nhận
+    slug (+ filename/count tuỳ chọn); chat/session lấy từ task_id tin cậy, không
+    nhận chat_id/path do model truyền.
+    """
+    p = _extract_tool_params(args, kwargs)
+    slug = _coerce_str_arg(p.get("slug", ""))
+    filename = _coerce_str_arg(p.get("filename", "")) or None
+    try:
+        count = max(1, min(int(p.get("count") or 1), 5))
+    except (TypeError, ValueError):
+        count = 1
+    try:
+        cfg = _load_landing_bridge_config(dict(os.environ), resolve_media_cache_dir())
+        bridge = _LandingMediaBridge(
+            cfg,
+            recent_fn=lambda chat_id, n: _RECENT_IMAGES.recent(chat_id, count=n),
+            session_resolver=_bridge_session_resolver,
+            http_post=_bridge_http_post,
+        )
+        result = bridge.upload_recent(
+            task_id=_coerce_str_arg(kwargs.get("task_id", "")),
+            slug=slug, filename=filename, count=count,
+        )
+    except _LandingBridgeError as e:
+        err = str(e)
+        # Targeted hints so the agent self-corrects instead of blaming the photo:
+        # a rejected upload usually means WRONG SLUG (agent invented one from the
+        # image content) or an ownership problem — not a broken image.
+        if "upload rejected" in err or "not_found" in err or "hội thoại khác" in err:
+            hint = ("Slug có thể SAI hoặc landing không thuộc hội thoại này. Gọi "
+                    "mcp_hitechcloud_landing_list để lấy đúng slug landing của hội thoại, "
+                    "rồi gọi lại tool này với slug đó. KHÔNG tự bịa slug từ nội dung ảnh.")
+        elif "no recent image" in err:
+            hint = "Nhờ khách gửi lại ảnh dạng ẢNH (không phải File), rồi thử lại."
+        else:
+            hint = "Thử lại; nếu vẫn lỗi, nhờ khách gửi lại ảnh dạng ẢNH (không phải File)."
+        return {"success": False, "error": err, "hint": hint}
+    except Exception:
+        logger.warning("[zalo-personal] landing bridge upload crashed", exc_info=True)
+        return {"success": False, "error": "upload lỗi nội bộ, thử lại sau."}
+    return {
+        "success": True,
+        **result,
+        "hint": (
+            "Dùng images[n].image_url làm hero_image/gallery rồi gọi "
+            "landing_update(slug, data={...}). KHÔNG cần base64."
+        ),
+    }
+
+
+def _zalo_api_call_handler(args: Any = None, **kwargs) -> Dict[str, Any]:
+    """CHỈ owner: gọi trực tiếp BẤT KỲ method zca-js nào qua sidecar.
+
+    Phủ toàn bộ tính năng còn lại: forwardMessage, sendVoice, sendCard,
+    createGroup, addUserToGroup, changeGroupName, blockUser, findUser,
+    getUserInfo, deleteMessage, undo, setMute, addQuickMessage..."""
+    p = _extract_tool_params(args, kwargs)
+    method = _coerce_str_arg(p.get("method", ""))
+    if not method:
+        return {"success": False, "error": "method required"}
+    raw_args = p.get("args")
+    if isinstance(raw_args, str) and raw_args.strip():
+        try:
+            raw_args = json.loads(raw_args)
+        except Exception as e:
+            return {"success": False, "error": "args không phải JSON hợp lệ: %s" % e}
+    if raw_args is None:
+        raw_args = []
+    if not isinstance(raw_args, list):
+        raw_args = [raw_args]
+    # Audit log: power tool gọi được mọi method zca-js — ghi WARNING đầy đủ
+    # để truy vết khi nghi prompt-injection điều khiển owner session.
+    logger.warning("[zalo-api-call] method=%s args=%s" % (
+        method, json.dumps(raw_args, ensure_ascii=False, default=str)[:1000]))
+    r = _post_sidecar_api(method, raw_args, timeout=60)
+    if r.get("error"):
+        return {"success": False, "error": r["error"]}
+    out = json.dumps(r.get("result"), ensure_ascii=False, default=str)
+    if len(out) > 8000:
+        out = out[:8000] + "...[cắt bớt]"
+    return {"success": True, "method": method, "result": out}
+
+
+# ═══════════════════════════════════════════════════════════════════════
 # PHỄU MARKETING — helper module-level + tool handler
 # ═══════════════════════════════════════════════════════════════════════
 def _mk_today() -> str:
@@ -7079,8 +9630,56 @@ def _zalo_campaign_sync_handler(args: Any = None, **kwargs) -> Dict[str, Any]:
             "message": f"Đã đồng bộ {len(leads)} lead lên Sheet: {camp.get('sheet_id')}"}
 
 
+def _tool_result_as_text(result: Any) -> Any:
+    """Coerce a handler result into the string the tool pipeline expects.
+
+    Hermes >= 0.20 rejects anything but a string (or the multimodal envelope)
+    with "Tool handler returned unsupported result type: dict", and every
+    handler in this plugin is annotated ``-> Dict[str, Any]``. On 2026-08-18/19
+    that broke 51 of 52 tools on a 0.20.4 host — 102 logged failures covering
+    zalo_get_chat_mode, zalo_set_chat_persona, zalo_send_image, zalo_send_pdf,
+    zalo_groups_list and more — while the same plugin kept working on a 0.18.0
+    host, which coerces with ``str()`` instead.
+
+    Serialising here rather than editing 51 handlers keeps the change in one
+    place and covers tools added later. It also improves the older hosts: they
+    used to receive a Python repr (``{'success': True}``) where the model now
+    gets real JSON.
+
+    ``default=str`` so a stray non-serialisable value degrades to its repr
+    instead of raising and losing the whole tool result.
+    """
+    if isinstance(result, str):
+        return result
+    if (
+        isinstance(result, dict)
+        and result.get("_multimodal") is True
+        and isinstance(result.get("content"), list)
+    ):
+        return result  # multimodal envelope — the pipeline consumes it as-is
+    return json.dumps(result, ensure_ascii=False, default=str)
+
+
+def _stringify_tool_handler(handler):
+    """Wrap a tool handler so its result always satisfies the pipeline."""
+    @functools.wraps(handler)
+    def _wrapped(*args, **kwargs):
+        return _tool_result_as_text(handler(*args, **kwargs))
+    return _wrapped
+
+
 def register(ctx):
     """Plugin entry point."""
+    # Every ctx.register_tool below hands back a dict; wrap once here so
+    # the pipeline always receives a string (see _tool_result_as_text).
+    _orig_register_tool = ctx.register_tool
+
+    def _register_tool(*a, **kw):
+        if callable(kw.get("handler")):
+            kw["handler"] = _stringify_tool_handler(kw["handler"])
+        return _orig_register_tool(*a, **kw)
+
+    ctx.register_tool = _register_tool
     kwargs = dict(
         name="zalo-personal",
         label="Zalo (cá nhân)",
@@ -7393,6 +9992,22 @@ def _register_zalo_tools(ctx) -> None:
                                     "Phong cách giao tiếp (vd: 'casual, hài hước', "
                                     "'chuyên nghiệp ngắn gọn')."
                                 ),
+                            },
+                            "notices": {
+                                "type": "object",
+                                "description": (
+                                    "Các CÂU HỆ THỐNG gửi thẳng ra khách (không qua "
+                                    "model) — PHẢI khớp xưng hô persona. Khi owner đổi "
+                                    "persona/xưng hô, LUÔN tự soạn lại 3 câu này đúng "
+                                    "giọng mới (vd persona xưng ta/con: 'Con chờ ta một "
+                                    "chút, ta kiểm tra lại cho rõ rồi báo con ngay.'). "
+                                    "Mỗi câu ngắn gọn, <=300 ký tự, thuần trấn an."
+                                ),
+                                "properties": {
+                                    "soft_error": {"type": "string", "description": "Câu trấn an khi hệ thống trục trặc nhẹ (thay 'Anh/chị chờ em chút…')."},
+                                    "recovery": {"type": "string", "description": "Câu báo quá tải + nhờ nhắn lại (thay 'Dạ em đang hơi quá tải…')."},
+                                    "deny_non_owner": {"type": "string", "description": "Câu từ chối chức năng chỉ dành cho chủ tài khoản."},
+                                },
                             },
                         },
                     },
@@ -7928,6 +10543,56 @@ def _register_zalo_tools(ctx) -> None:
             emoji="📕",
         )
         ctx.register_tool(
+            name="zalo_send_file",
+            toolset="hermes-zalo",
+            schema={
+                "type": "function",
+                "function": {
+                    "name": "zalo_send_file",
+                    "description": (
+                        "GỬI THẲNG một file CÓ SẴN vào chat Zalo (docx, doc, "
+                        "zip, txt, csv, mp3, ...). Nhận 'url' công khai (vd "
+                        "file do công cụ MCP hitechcloud tạo: "
+                        "https://mcp.hitechcloud.vn/media/....docx) HOẶC 'file_path' "
+                        "local trên server. Dùng khi ĐÃ có sẵn file/URL — "
+                        "TUYỆT ĐỐI KHÔNG dán link tải cho khách, BẮT BUỘC gọi "
+                        "tool này để đẩy file vào Zalo. Cần RENDER mới thì dùng "
+                        "zalo_send_pdf/xlsx/pptx. Người ngoài owner gọi được "
+                        "(rate limit 10/giờ/chat, 5/giờ/người)."
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "url": {
+                                "type": "string",
+                                "description": "URL công khai http/https của file cần gửi.",
+                            },
+                            "file_path": {
+                                "type": "string",
+                                "description": "Đường dẫn file local trên server (thay cho url).",
+                            },
+                            "filename": {
+                                "type": "string",
+                                "description": "Tên file hiển thị (giữ đuôi, vd HD-hitechcloud.docx). Bỏ trống = suy từ url.",
+                            },
+                            "chat_id": {
+                                "type": "string",
+                                "description": "Chat/group ID. Bỏ trống = gửi chat hiện tại.",
+                            },
+                            "caption": {
+                                "type": "string",
+                                "description": "Caption kèm file (tuỳ chọn).",
+                            },
+                        },
+                        "required": [],
+                    },
+                },
+            },
+            handler=_zalo_send_file_handler,
+            description="Send an existing file (by URL or local path) into a Zalo chat.",
+            emoji="📎",
+        )
+        ctx.register_tool(
             name="zalo_send_pptx",
             toolset="hermes-zalo",
             schema={
@@ -8055,6 +10720,56 @@ def _register_zalo_tools(ctx) -> None:
             handler=_zalo_send_xlsx_handler,
             description="Generate XLSX from spec and send into a Zalo chat.",
             emoji="📈",
+        )
+        ctx.register_tool(
+            name="zalo_send_image",
+            toolset="hermes-zalo",
+            schema={
+                "type": "function",
+                "function": {
+                    "name": "zalo_send_image",
+                    "description": (
+                        "Gửi ẢNH cho khách. Truyền MỘT trong hai: `image_url` "
+                        "(ƯU TIÊN — link ảnh nội bộ như qr_url/url từ media_store "
+                        "mcp.hitechcloud.vn; adapter tự tải, KHÔNG phình context) hoặc "
+                        "`image_base64` (mã QR/ảnh dạng base64). TUYỆT ĐỐI KHÔNG "
+                        "dán chuỗi base64 hay URL vào tin nhắn text."
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "image_url": {
+                                "type": "string",
+                                "description": (
+                                    "Link ảnh https NỘI BỘ (vd qr_url/url từ "
+                                    "get_payment_qr/tao_qr — host mcp.hitechcloud.vn). "
+                                    "Ưu tiên dùng cái này thay vì base64."
+                                ),
+                            },
+                            "image_base64": {
+                                "type": "string",
+                                "description": (
+                                    "Chuỗi ảnh base64 (có/không tiền tố "
+                                    "`data:image/...;base64,`). PNG/JPEG/GIF/WebP. "
+                                    "Chỉ dùng khi KHÔNG có url."
+                                ),
+                            },
+                            "caption": {
+                                "type": "string",
+                                "description": "Chú thích kèm ảnh (tuỳ chọn).",
+                            },
+                            "chat_id": {
+                                "type": "string",
+                                "description": "Chat/group ID. Bỏ trống = gửi chat hiện tại.",
+                            },
+                        },
+                        "required": [],
+                    },
+                },
+            },
+            handler=_zalo_send_image_handler,
+            description="Decode a base64 image and send it as a photo into a Zalo chat.",
+            emoji="🖼️",
         )
         ctx.register_tool(
             name="zalo_set_chat_persona",
@@ -8326,9 +11041,162 @@ def _register_zalo_tools(ctx) -> None:
                 "parameters": {"type": "object", "properties": {
                     "campaign": {"type": "string"}}, "required": ["campaign"]}}},
             handler=_zalo_campaign_sync_handler, description="Đồng bộ Sheet chiến dịch.", emoji="🔄")
+        # ── zca-js passthrough tools: poll / note / reminder / board /
+        #    friend-accept / đọc ảnh gần nhất / generic api_call ──────────
+        ctx.register_tool(
+            name="zalo_create_poll", toolset="hermes-zalo",
+            schema={"type": "function", "function": {
+                "name": "zalo_create_poll",
+                "description": (
+                    "Tạo POLL (bình chọn) trong nhóm Zalo hiện tại. Dùng khi sếp nói "
+                    "'tạo poll/bình chọn/khảo sát ...'. Cần câu hỏi + ít nhất 2 lựa chọn."),
+                "parameters": {"type": "object", "properties": {
+                    "question": {"type": "string", "description": "Câu hỏi bình chọn"},
+                    "options": {"type": "array", "items": {"type": "string"}, "description": "Các lựa chọn (2-10)"},
+                    "chat_id": {"type": "string", "description": "Group ID (bỏ trống = nhóm hiện tại)"},
+                    "multi_choice": {"type": "boolean", "description": "Cho chọn nhiều đáp án"},
+                    "allow_add_option": {"type": "boolean", "description": "Cho thành viên thêm lựa chọn"},
+                    "hide_results": {"type": "boolean", "description": "Ẩn kết quả tới khi vote"},
+                    "anonymous": {"type": "boolean", "description": "Ẩn danh người vote"},
+                    "expires_hours": {"type": "number", "description": "Hết hạn sau N giờ (0 = không hết hạn)"}},
+                    "required": ["question", "options"]}}},
+            handler=_zalo_create_poll_handler, description="Tạo poll trong nhóm Zalo.", emoji="🗳")
+        ctx.register_tool(
+            name="zalo_create_note", toolset="hermes-zalo",
+            schema={"type": "function", "function": {
+                "name": "zalo_create_note",
+                "description": (
+                    "Tạo GHI CHÚ (note) lên bảng tin nhóm Zalo. Dùng khi sếp nói "
+                    "'ghi chú lại ...', 'tạo note trong nhóm ...'. Có thể ghim (pin)."),
+                "parameters": {"type": "object", "properties": {
+                    "title": {"type": "string", "description": "Nội dung ghi chú"},
+                    "chat_id": {"type": "string", "description": "Group ID (bỏ trống = nhóm hiện tại)"},
+                    "pin": {"type": "boolean", "description": "Ghim ghi chú lên đầu nhóm"}},
+                    "required": ["title"]}}},
+            handler=_zalo_create_note_handler, description="Tạo ghi chú bảng tin nhóm.", emoji="📝")
+        ctx.register_tool(
+            name="zalo_create_reminder", toolset="hermes-zalo",
+            schema={"type": "function", "function": {
+                "name": "zalo_create_reminder",
+                "description": (
+                    "Tạo NHẮC HẸN NATIVE trên Zalo (hiện ở bảng tin chat 1-1 hoặc nhóm). "
+                    "CHỈ dùng khi sếp NÓI RÕ chữ 'zalo' (vd 'tạo nhắc hẹn trên Zalo', "
+                    "'đặt reminder Zalo cho nhóm'). Lịch nhắc thông thường ('nhắc tao 9h họp', "
+                    "'tạo reminder mai gọi khách') KHÔNG dùng tool này — dùng cron của Hermes. "
+                    "Thời gian: at='YYYY-MM-DD HH:MM' hoặc in_minutes=N phút nữa."),
+                "parameters": {"type": "object", "properties": {
+                    "title": {"type": "string", "description": "Nội dung nhắc"},
+                    "chat_id": {"type": "string", "description": "Thread ID (bỏ trống = chat hiện tại)"},
+                    "at": {"type": "string", "description": "Thời điểm nhắc 'YYYY-MM-DD HH:MM' (giờ VN)"},
+                    "in_minutes": {"type": "number", "description": "Hoặc: nhắc sau N phút"},
+                    "emoji": {"type": "string", "description": "Emoji nhắc (mặc định ⏰)"},
+                    "repeat": {"type": "string", "enum": ["none", "daily", "weekly", "monthly"],
+                               "description": "Lặp lại"}},
+                    "required": ["title"]}}},
+            handler=_zalo_create_reminder_handler, description="Tạo nhắc hẹn Zalo.", emoji="⏰")
+        ctx.register_tool(
+            name="zalo_schedule_reminder", toolset="hermes-zalo",
+            schema={"type": "function", "function": {
+                "name": "zalo_schedule_reminder",
+                "description": (
+                    "Đặt LỊCH NHẮC trong NHÓM: tới giờ bot tự gửi TIN NHẮN nhắc, tag @người. "
+                    "Dùng khi có người nhờ nhắc ai đó làm gì đúng giờ (vd '5 phút nữa nhắc "
+                    "@Trân nộp bài', 'nhắc mọi người 8h họp'). Nội dung nhắc bot tự soạn lúc gửi. "
+                    "Có thể escalation nhiều lần nếu kèm 'deadline' + 'max_attempts'. CHỈ trong nhóm."),
+                "parameters": {"type": "object", "properties": {
+                    "task": {"type": "string", "description": "Việc cần nhắc (vd 'nộp bài')"},
+                    "target": {"type": "string", "description": "Tên hiển thị người được nhắc để tag (@). Bỏ trống = nhắc chung."},
+                    "in_minutes": {"type": "number", "description": "Nhắc sau N phút"},
+                    "at": {"type": "string", "description": "Hoặc thời điểm 'YYYY-MM-DD HH:MM' (giờ VN)"},
+                    "deadline": {"type": "string", "description": "Hạn chót 'YYYY-MM-DD HH:MM' (tùy chọn, để escalation)"},
+                    "deadline_in_minutes": {"type": "number", "description": "Hoặc hạn chót sau N phút"},
+                    "max_attempts": {"type": "number", "description": "Số lần nhắc leo thang tới hạn (1-5, mặc định 3 nếu có deadline)"}},
+                    "required": ["task"]}}},
+            handler=_zalo_schedule_reminder_handler,
+            description="Đặt lịch nhắc tag người trong nhóm.", emoji="⏰")
+        ctx.register_tool(
+            name="zalo_board_action", toolset="hermes-zalo",
+            schema={"type": "function", "function": {
+                "name": "zalo_board_action",
+                "description": (
+                    "Thao tác BẢNG TIN nhóm Zalo: action=list (liệt kê note/poll/reminder + id), "
+                    "poll_detail (xem kết quả poll), poll_lock (khoá poll), poll_vote (vote hộ), "
+                    "note_edit (sửa ghi chú), reminder_remove (xoá nhắc hẹn), reminder_list."),
+                "parameters": {"type": "object", "properties": {
+                    "action": {"type": "string", "enum": ["list", "poll_detail", "poll_lock", "poll_vote",
+                                                          "note_edit", "reminder_remove", "reminder_list"]},
+                    "chat_id": {"type": "string", "description": "Thread ID (bỏ trống = chat hiện tại)"},
+                    "poll_id": {"type": "integer", "description": "ID poll (cho poll_*)"},
+                    "option_ids": {"type": "array", "items": {"type": "integer"}, "description": "ID lựa chọn (poll_vote)"},
+                    "topic_id": {"type": "string", "description": "ID ghi chú (note_edit)"},
+                    "title": {"type": "string", "description": "Nội dung mới (note_edit)"},
+                    "pin": {"type": "boolean", "description": "Ghim (note_edit)"},
+                    "reminder_id": {"type": "string", "description": "ID nhắc hẹn (reminder_remove)"}},
+                    "required": ["action"]}}},
+            handler=_zalo_board_action_handler, description="Quản lý bảng tin nhóm (poll/note/reminder).", emoji="📋")
+        ctx.register_tool(
+            name="zalo_friend_accept", toolset="hermes-zalo",
+            schema={"type": "function", "function": {
+                "name": "zalo_friend_accept",
+                "description": (
+                    "CHẤP NHẬN lời mời kết bạn từ một uid. Dùng khi sếp nói 'chấp nhận kết bạn "
+                    "người này' (uid từ thông báo lời mời hoặc zalo_lookup_phones)."),
+                "parameters": {"type": "object", "properties": {
+                    "uid": {"type": "string", "description": "Zalo UID người gửi lời mời"}},
+                    "required": ["uid"]}}},
+            handler=_zalo_friend_accept_handler, description="Chấp nhận lời mời kết bạn.", emoji="🤝")
+        ctx.register_tool(
+            name="zalo_read_recent_image", toolset="hermes-zalo",
+            schema={"type": "function", "function": {
+                "name": "zalo_read_recent_image",
+                "description": (
+                    "Lấy đường dẫn ẢNH GẦN NHẤT người dùng đã gửi trong chat HIỆN TẠI "
+                    "(giữ 5 ảnh gần nhất). Dùng khi được hỏi 'hình vừa gửi nói gì', 'đọc ảnh trên'. "
+                    "Sau khi có path, gọi vision_analyze để đọc nội dung ảnh."),
+                "parameters": {"type": "object", "properties": {
+                    "count": {"type": "integer", "description": "Số ảnh gần nhất cần lấy (1-5, mặc định 1)"}}}}},
+            handler=_zalo_read_recent_image_handler, description="Lấy ảnh gần nhất trong chat để đọc.", emoji="🖼")
+        ctx.register_tool(
+            name="zalo_upload_recent_image_to_landing", toolset="hermes-zalo",
+            schema={"type": "function", "function": {
+                "name": "zalo_upload_recent_image_to_landing",
+                "description": (
+                    "Đưa ẢNH GẦN NHẤT khách gửi trong chat HIỆN TẠI lên landing DEMO của "
+                    "đúng hội thoại này, TRẢ VỀ image_url công khai. Dùng khi khách gửi ảnh "
+                    "qua Zalo và cần gắn lên landing (hero/banner/gallery). Upload chạy nền "
+                    "server-to-server — KHÔNG kéo base64 qua hội thoại. Ảnh được TỰ ĐỘNG "
+                    "thu nhỏ về tối đa 1024px trước khi upload (ảnh điện thoại cỡ lớn vẫn "
+                    "up được). Sau khi có images[n].image_url, gọi "
+                    "landing_update(slug, data={...}) để gắn ảnh."),
+                "parameters": {"type": "object", "properties": {
+                    "slug": {"type": "string", "description": (
+                        "Slug landing CÓ THẬT của hội thoại (từ landing_build trước đó hoặc "
+                        "mcp_hitechcloud_landing_list). TUYỆT ĐỐI không tự bịa slug từ nội dung ảnh.")},
+                    "filename": {"type": "string", "description": "Tên gợi ý cho ảnh (tuỳ chọn)"},
+                    "count": {"type": "integer", "description": "Số ảnh gần nhất cần up (1-5, mặc định 1)"}},
+                    "required": ["slug"]}}},
+            handler=_zalo_upload_recent_image_to_landing_handler,
+            description="Up ảnh Zalo gần nhất lên landing (server-to-server, không base64).", emoji="🖼")
+        ctx.register_tool(
+            name="zalo_api_call", toolset="hermes-zalo",
+            schema={"type": "function", "function": {
+                "name": "zalo_api_call",
+                "description": (
+                    "CHỈ owner — power tool: gọi TRỰC TIẾP một method zca-js bất kỳ. "
+                    "Ví dụ: forwardMessage, sendVoice, sendCard, createGroup, addUserToGroup, "
+                    "removeUserFromGroup, changeGroupName, changeGroupAvatar, blockUser, findUser, "
+                    "getUserInfo, setMute, pinConversations, addQuickMessage... "
+                    "args = mảng tham số theo đúng signature zca-js; ThreadType: 0=User, 1=Group. "
+                    "Vd: method=changeGroupName, args=[\"Tên mới\", \"<group_id>\"]."),
+                "parameters": {"type": "object", "properties": {
+                    "method": {"type": "string", "description": "Tên method zca-js"},
+                    "args": {"type": "array", "items": {}, "description": "Mảng tham số theo signature zca-js"}},
+                    "required": ["method"]}}},
+            handler=_zalo_api_call_handler, description="Gọi method zca-js bất kỳ (owner-only).", emoji="🧰")
         logger.info(
             "[zalo-personal] registered tools: core (send/scan/marketing/"
-            "friend/dm/media/sticker/persona/file-gen)"
+            "friend/dm/media/sticker/persona/file-gen) + zca passthrough "
+            "(poll/note/reminder/board/friend-accept/read-image/api-call)"
         )
     except Exception as e:
         logger.warning(f"[zalo-personal] tool registration failed: {e}")
